@@ -1,0 +1,3435 @@
+--// =============================
+--// PARTE 1: LÓGICA DO SISTEMA
+--// =============================
+
+--// CHAT GLOBAL (LocalScript)
+local HttpService = game:GetService("HttpService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local TweenService = game:GetService("TweenService") 
+local RunService = game:GetService("RunService") 
+
+-- RASTREAMENTO DE AUDIO
+local currentPlayingSound = nil -- Variável global para o objeto Sound atualmente ativo
+
+-- NOVA URL do Google Apps Script
+local url = "https://script.google.com/macros/s/AKfycbzWyWKDBGctMyjXBdKYN6L0ghJO4Ds971EH-pYlMYTuIV2I8zMgy9Rt253tgVu21fg37Q/exec"
+-- CHAVE MANTIDA APENAS PARA OPERAÇÕES DE ESCRITA (POST/Celulas)
+local API_KEY = "0409200815072025-secretAPI"
+
+-- VARIÁVEIS DE CONTROLE DE CARREGAMENTO
+local MESSAGES_TO_LOAD_INITIAL = 50	
+local MESSAGES_TO_LOAD_MORE = 20 	
+local currentLoadedLimit = MESSAGES_TO_LOAD_MORE
+local isInitialLoadComplete = false	
+
+-- Variável para controlar o cooldown do botão "Carregar mais"
+local isLoadOldCooldown = false
+
+-- Variáveis de Controle de Loading Screen
+local loadingStatus = 0
+local isLoadingCompleted = false
+local loadingFrame 
+
+-- Rastreamento de comandos e caches
+local comandosExecutados = {}	
+local comandos = {}
+local experienceNameCache = {}
+local playerInfo = {}
+
+-- NOME DAS ABAS NA PLANILHA
+local INFO_SHEET_NAME = "InfoPlayers"	
+local DATA_SHEET_NAME = "ChatGlobal"
+local PUNICOES_SHEET_NAME = "Punicoes" -- NOVA ABA PARA REGISTRO DE PUNIÇÕES
+
+-- [[ FUNÇÃO DE REQUISIÇÃO HTTP ]]
+local function http_request(options)
+	local responseData = nil
+	local success, response = pcall(function()
+		if HttpService.RequestAsync then
+			responseData = HttpService:RequestAsync(options)
+			return responseData.Success and responseData
+		end
+		-- Fallback for older or exploited environments
+		if options.Method == "GET" then
+			local body = HttpService:GetAsync(options.Url)
+			return {Success = true, Body = body}
+		elseif options.Method == "POST" and options.Body then
+			local body = HttpService:PostAsync(options.Url, options.Body, Enum.HttpContentType.ApplicationJson)
+			return {Success = true, Body = body}
+		end
+		return nil
+	end)
+	
+	if success and response and (response.Success or response.Body) then
+		return response
+	else
+		return nil
+	end
+end
+
+-- ==========================================================
+-- [[ FUNÇÕES DE CÉLULAS ESPECÍFICAS (PARA GESTÃO DE CONTA) ]]
+-- ==========================================================
+
+-- FUNÇÃO PARA LER CÉLULAS (GET - Não precisa de API_KEY na URL)
+local function LerCelula(sheetName, startRow, startCol, numRows, numCols)
+	numRows = numRows or 1
+	numCols = numCols or 1
+	
+	local query = {
+		pagina = "Celulas",	
+		sheet = sheetName,
+		startRow = startRow,
+		startCol = startCol,
+		numRows = numRows,
+		numCols = numCols
+	}
+	
+	local queryString = {}
+	for k, v in pairs(query) do
+		table.insert(queryString, string.format("%s=%s", k, HttpService:UrlEncode(tostring(v))))
+	end
+	local finalUrl = url .. "?" .. table.concat(queryString, "&")
+	
+	local success, response = pcall(function()
+		return http_request({ Url = finalUrl, Method = "GET" })
+	end)
+	
+	if success and response and response.Body then
+		local result = HttpService:JSONDecode(response.Body)
+		if result and result.success then return result.values end
+	end
+	return nil
+end
+
+-- FUNÇÃO PARA ESCREVER CÉLULAS (POST - Requer API_KEY no corpo - GARANTE SOBRESCRITA)
+local function EscreverCelula(sheetName, startRow, startCol, values)
+	if not values or #values == 0 then return false end
+
+	local payload = {
+		pagina = "Celulas",	
+		sheet = sheetName,
+		startRow = startRow,
+		startCol = startCol,
+		values = values,
+		apikey = API_KEY	
+	}
+
+	local success, response = pcall(function()
+		return http_request({
+			Url = url,
+			Method = "POST",
+			Headers = {["Content-Type"] = "application/json"},
+			Body = HttpService:JSONEncode(payload)
+		})
+	end)
+	
+	if success and response and response.Body then
+		local result = HttpService:JSONDecode(response.Body)
+		return result and result.success or false
+	end
+	return false
+end
+
+-- ==========================================================
+-- [[ GESTÃO DE INFORMAÇÕES DO JOGADOR ]]
+-- ==========================================================
+
+-- Constantes de Cooldown e Permissão
+local DEFAULT_COOLDOWN = 61
+local VIP_COOLDOWN = 11
+local ADM_COOLDOWN = 4
+local DEV_COOLDOWN = 0	
+
+-- CONSTANTE DE COOLDOWN PARA MÍDIA
+local VIP_MEDIA_COOLDOWN = 60 	-- Cooldown para Audio/Imagem (VIP)
+
+local PERMISSION_ORDER = {["DEFAULT"] = 0, ["VIP"] = 1, ["ADM"] = 2, ["DEV"] = 3}
+
+-- Rastreadores de tempo para cooldowns
+local lastSentTime = 0 			-- Para mensagens padrão
+local lastSentMediaTypeTime = 0 -- Para Audio e Imagem
+
+-- Colunas de interesse na aba "InfoPlayers" (Base 1, USANDO NOVA ESTRUTURA A-G)
+local Class_COL = 3 			 -- Coluna C
+local TIMESTAMP_PRIMEIRA_COL = 4 -- Coluna D
+local ID_PRIMEIRA_COL = 5 	     -- Coluna E
+local TIMESTAMP_ULTIMA_COL = 6 	-- Coluna F
+local ID_ULTIMA_COL = 7 		 -- Coluna G
+local STATUS_COL = 8             -- Coluna H (Nova coluna "Status" que pode conter "Punido")
+
+-- Função auxiliar para atualizar a tela de carregamento (NOVO)
+local function UpdateLoadingStatus(status, description, increment)
+    if isLoadingCompleted then return end
+	
+    loadingStatus = loadingStatus + (increment or 0)
+    local percentage = math.min(loadingStatus, 100) / 100
+    
+	if loadingFrame and loadingFrame:FindFirstChild("ProgressBar") then
+		local progressBar = loadingFrame.ProgressBar
+		local progressFill = progressBar.ProgressFill
+		local progressLabel = loadingFrame.ProgressLabel
+		local statusLabel = loadingFrame.StatusLabel
+		
+		-- Anima a barra de progresso
+		TweenService:Create(progressFill, TweenInfo.new(0.5, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+			Size = UDim2.new(percentage, 0, 1, 0)
+		}):Play()
+		
+		-- Atualiza o texto de status
+		if statusLabel then statusLabel.Text = description end
+		if progressLabel then progressLabel.Text = string.format("%d%%", math.floor(percentage * 100)) end
+		
+		if status >= 100 then
+			isLoadingCompleted = true
+			statusLabel.Text = "✅ Chat Pronto! Inicializando UI..."
+			task.wait(1)
+			-- Faz um fade out suave do frame de carregamento
+			TweenService:Create(loadingFrame, TweenInfo.new(0.5), {BackgroundTransparency = 1, Transparency = 1}):Play()
+			
+			-- Destrói o frame de carregamento para liberar interação
+			task.delay(0.6, function() 
+                if loadingFrame and loadingFrame.Destroy then loadingFrame:Destroy() end
+            end)
+		end
+	end
+end
+
+-- Função para carregar as informações do jogador
+local function LoadPlayerInfo()
+	UpdateLoadingStatus(0, "🌐 Carregando informações de permissão do usuário...", 33) -- NOVO
+	
+	local success, result = pcall(function()
+		local response = http_request({
+			Url = url.."?pagina="..INFO_SHEET_NAME,	
+			Method = "GET"	
+		})
+		if not response or not response.Body then return nil end
+		return HttpService:JSONDecode(response.Body)
+	end)
+	
+	if success and result and type(result) == "table" then
+		local newInfo = {}
+		for i, info in ipairs(result) do
+			local userId = tonumber(info.UserId)
+			local row = i + 1 -- A linha real na planilha (1 + índice i)
+			
+			if userId then
+				newInfo[userId] = {
+					Class = (info.Class or "DEFAULT"):upper(),
+					PlayerName = info.PlayerName or "Desconhecido",
+					TimestampPrimeira = tonumber(info.TimestampPrimeira) or 0,
+					IDPrimeiraMensagem = info.IDPrimeiraMensagem or "",
+					TimestampUltima = tonumber(info.TimestampUltima) or 0,
+					IDUltimaMensagem = info.IDUltimaMensagem or "",
+					Row = row,
+					Status = (info.Status or "") -- NOVO: Lê a coluna "Status" (ex: "Punido")
+				}	
+			end
+		end
+		playerInfo = newInfo
+		print(string.format("Informações de %d jogadores carregadas da aba '%s'.", #result, INFO_SHEET_NAME))
+		UpdateLoadingStatus(0, "✅ Permissões carregadas. Iniciando download de mensagens...", 33) -- NOVO
+
+		-- Se o próprio jogador estiver marcado como punido, recuperar os detalhes e aplicar ban local
+		local myInfo = playerInfo[LocalPlayer.UserId]
+		if myInfo and myInfo.Status and myInfo.Status:lower() == "punido" then
+			-- Busca no histórico de punições os detalhes e aplica o ban local
+			task.spawn(function()
+				UpdateLoadingStatus(0, "🔒 Você está punido. Recuperando detalhes...", 0)
+				local punicoesSuccess, punicoes = pcall(function()
+					local resp = http_request({ Url = url.."?pagina="..PUNICOES_SHEET_NAME, Method = "GET" })
+					if not resp or not resp.Body then return nil end
+					return HttpService:JSONDecode(resp.Body)
+				end)
+				if punicoesSuccess and type(punicoes) == "table" then
+					-- procura a entrada mais recente para este UserId
+					local latest = nil
+					for _, p in ipairs(punicoes) do
+						if tonumber(p.TargetUserId) == LocalPlayer.UserId then
+							latest = p
+						end
+					end
+					if latest then
+						-- Aplica ban local baseado nos detalhes encontrados
+						-- (função ApplyLocalBan implementada mais abaixo)
+						if latest.Motivo or latest.DurationMinutes then
+							-- converte Duration
+							local banDetails = {
+								TargetUserId = tonumber(latest.TargetUserId) or LocalPlayer.UserId,
+								TargetName = latest.TargetName or LocalPlayer.Name,
+								ModeratorUserId = tonumber(latest.ModeratorUserId) or 0,
+								ModeratorName = latest.ModeratorName or "Unknown",
+								Motivo = latest.Motivo or "",
+								DurationMinutes = tonumber(latest.DurationMinutes) or 0,
+								Timestamp = tonumber(latest.Timestamp) or os.time(),
+								MessageID = latest.MessageID or ""
+							}
+							-- Apply
+							task.delay(0.1, function()
+								-- ApplyLocalBan may not yet be defined; we will check later (declared below)
+								if type(ApplyLocalBan) == "function" then
+									ApplyLocalBan(banDetails)
+								else
+									-- Emite uma flag para ser checada mais tarde
+									_G.__pending_local_ban = banDetails
+								end
+							end)
+						end
+					end
+				end
+			end)
+		end
+
+	else
+		warn("Erro ao carregar informações dos jogadores. Usando permissão padrão.")
+		UpdateLoadingStatus(0, "⚠️ Erro ao carregar permissões. Usando Padrão.", 33) -- NOVO
+	end
+end
+
+-- Função para obter o nível de permissão (Mantida)
+local function GetPlayerPermissionClass()
+	local info = playerInfo[LocalPlayer.UserId]
+	return info and info.Class or "DEFAULT"
+end
+
+-- Função para obter o cooldown Padrão
+local function GetPlayerCooldown()
+	local Class = GetPlayerPermissionClass()
+	if Class == "DEV" then return DEV_COOLDOWN end
+	if Class == "ADM" then return ADM_COOLDOWN end
+	if Class == "VIP" then return VIP_COOLDOWN end
+	return DEFAULT_COOLDOWN
+end
+
+-- Função para verificar se a permissão é suficiente (Mantida)
+local function IsPermissionSufficient(requiredClass)
+	local playerClass = GetPlayerPermissionClass()
+	local requiredOrder = PERMISSION_ORDER[requiredClass:upper()] or 0
+	local playerOrder = PERMISSION_ORDER[playerClass:upper()] or 0
+	return playerOrder >= requiredOrder
+end
+
+-- Função para atualizar a linha do jogador com a última mensagem
+local function UpdatePlayerLastMessage(messageId, currentTime)
+	local player_id = LocalPlayer.UserId
+	local info = playerInfo[player_id]
+	
+	if info and info.Row then
+		-- JOGADOR EXISTENTE: SOBRESCREVE a célula UltimaMensagem (Timestamp e ID)
+		
+		local valuesToWrite = {{currentTime, messageId}} -- {{Timestamp, ID}}
+		local startCol = TIMESTAMP_ULTIMA_COL -- Coluna F
+		local numCols = 2 -- Escreve nas colunas F e G
+		
+		-- Atualiza SOMENTE as colunas de Última Mensagem
+		local success = EscreverCelula(
+			INFO_SHEET_NAME,	
+			info.Row,	
+			startCol,	
+			valuesToWrite	
+		)
+		
+		-- Se for a primeira vez que o jogador envia uma mensagem (mas já tinha registro de Class)
+		-- Devemos sobrescrever também os campos de Primeira Mensagem
+		if info.TimestampPrimeira == 0 then
+			-- Sobrescreve nas colunas de Primeira Mensagem (D e E)
+			EscreverCelula(
+				INFO_SHEET_NAME,	
+				info.Row,	
+				TIMESTAMP_PRIMEIRA_COL,	
+				valuesToWrite
+			)
+		end
+		
+		if success then
+			-- Atualiza o cache local
+			playerInfo[player_id].TimestampUltima = currentTime
+			playerInfo[player_id].IDUltimaMensagem = messageId
+			if playerInfo[player_id].TimestampPrimeira == 0 then
+				 playerInfo[player_id].TimestampPrimeira = currentTime
+				 playerInfo[player_id].IDPrimeiraMensagem = messageId
+			end
+		else
+			warn("Falha ao atualizar a UltimaMensagem e ID para o UserId:", player_id)
+		end
+	else
+		-- NOVO JOGADOR: Envia um POST completo para CRIAR uma nova linha (appendRow no Apps Script)
+		local payload = {
+			pagina = INFO_SHEET_NAME,	
+			UserId = player_id,
+			PlayerName = LocalPlayer.Name,
+			Class = "DEFAULT",
+			-- NOVOS CAMPOS: Timestamp e ID para ambas
+			TimestampPrimeira = currentTime,
+			IDPrimeiraMensagem = messageId,
+			TimestampUltima = currentTime,
+			IDUltimaMensagem = messageId,
+			apikey = API_KEY	
+		}
+
+		local success, _ = pcall(function()
+			return http_request({
+				Url = url,
+				Method = "POST",
+				Headers = {["Content-Type"] = "application/json"},
+				Body = HttpService:JSONEncode(payload)
+			})
+		end)
+
+		if success then
+			-- Recarrega a tabela de info em 5s para pegar a nova Row
+			task.delay(5, LoadPlayerInfo)	
+		else
+			warn("Falha ao criar o registro do novo jogador.", player_id)
+		end
+	end
+end
+
+-- [[ FUNÇÕES AUXILIARES (Mantidas) ]]
+local function GetInicioDoDia(timestamp)
+	if type(timestamp) ~= "number" or timestamp == 0 then return 0 end
+	local t = os.date("*t", timestamp)
+	return os.time({year=t.year, month=t.month, day=t.day, hour=0, min=0, sec=0})
+end
+local function GetExperienceNameById(id)
+	if experienceNameCache[id] then return experienceNameCache[id] end
+	local nome = "Jogo?"
+	local success, info = pcall(function()
+		return MarketplaceService:GetProductInfo(id, Enum.InfoType.Asset)
+	end)
+	if success and info and info.Name then nome = info.Name else nome = "Jogo #"..id end
+	experienceNameCache[id] = nome
+	return nome
+end
+local function FormatarTempoRelativo(timestampMsg)
+	if type(timestampMsg) ~= "number" or timestampMsg == 0 then return "?" end
+	local diff = math.max(os.time() - timestampMsg, 0)
+	if diff < 60 then return diff.."s"
+	elseif diff < 3600 then return math.floor(diff/60).."m"
+	elseif diff < 86400 then return math.floor(diff/3600).."h"
+	elseif diff < 864000 then return math.floor(diff/86400).."d"
+	else return os.date("%d/%m", timestampMsg) end
+end
+local function GetPlayerThumbnail(userId)
+	local content = ""
+	pcall(function()
+		content = Players:GetUserThumbnailAsync(userId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+	end)
+	return content
+end
+local function FormatarData(timestamp)
+	local inicioMsg = GetInicioDoDia(timestamp)
+	local inicioHoje = GetInicioDoDia(os.time())
+	local inicioOntem = GetInicioDoDia(os.time() - 86400)
+	if inicioMsg == inicioHoje then return "Hoje"
+	elseif inicioMsg == inicioOntem then return "Ontem"
+	else return os.date("%d/%m/%Y", timestamp) end
+end
+
+-- NOVO: Função para formatar segundos para M:SS
+local function FormatTime(seconds)
+    if not seconds or seconds < 0 then return "0:00" end
+    local minutes = math.floor(seconds / 60)
+    local remainingSeconds = math.floor(seconds % 60)
+    return string.format("%d:%02d", minutes, remainingSeconds)
+end
+
+-- FLAG e função para aplicar ban localmente (bloqueia envio/GUI)
+local isLocallyBanned = false
+local localBanDetails = nil
+
+function ApplyLocalBan(banDetails)
+	-- banDetails is a table with: TargetUserId, TargetName, ModeratorUserId, ModeratorName, Motivo, DurationMinutes, Timestamp, MessageID
+	isLocallyBanned = true
+	localBanDetails = banDetails or {}
+	
+	-- Bloqueia o input de envio e exibe aviso claro no Placeholder
+	if TextBox then
+		TextBox.PlaceholderText = string.format("🔒 Você está punido: %s — Motivo: %s", localBanDetails.TargetName or "Você", localBanDetails.Motivo or "Sem motivo")
+		TextBox.TextEditable = false
+	end
+	if Enviar then Enviar.Active = false end
+	if MediaButton then MediaButton.Active = false end
+
+	-- Opcional: Mostrar um banner persistente no chat informando o ban
+	local banNotice = Instance.new("TextLabel", ScrollingFrame)
+	banNotice.Name = "LocalBanNotice"
+	banNotice.Size = UDim2.new(1, -20, 0, 40)
+	banNotice.Position = UDim2.new(0, 10, 1, 0)
+	banNotice.BackgroundTransparency = 0.2
+	banNotice.BackgroundColor3 = Color3.fromRGB(60, 10, 10)
+	banNotice.TextColor3 = Color3.fromRGB(255, 200, 200)
+	banNotice.Text = string.format("🔒 Você está punido: %s — Motivo: %s", localBanDetails.TargetName or "Você", localBanDetails.Motivo or "Sem motivo")
+	banNotice.Font = Enum.Font.SourceSansBold
+	banNotice.TextSize = 14
+	banNotice.ZIndex = 5
+	task.defer(function()
+		ScrollingFrame.CanvasSize = UDim2.new(0,0,0,UIListLayout.AbsoluteContentSize.Y)
+	end)
+end
+
+-- Função para remover ban local (se necessário no futuro)
+function UnapplyLocalBan()
+	isLocallyBanned = false
+	localBanDetails = nil
+	if TextBox then
+		TextBox.PlaceholderText = "Digite sua mensagem..."
+		TextBox.TextEditable = true
+	end
+	if Enviar then Enviar.Active = true end
+	if MediaButton then MediaButton.Active = true end
+	local old = ScrollingFrame:FindFirstChild("LocalBanNotice")
+	if old and old.Destroy then old:Destroy() end
+end
+
+-- ==========================================================
+-- // PARTE 2: VISUAL (GUI)
+-- // O código a seguir cria a interface (mantido e reutilizado).
+-- ==========================================================
+
+-- Variáveis Globais (Definidas ou mantidas)
+local LocalPlayer = game.Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local InputService = game:GetService("UserInputService")
+-- RunService já definido acima (RunService = game:GetService("RunService"))
+
+local currentPlayingSound = nil 
+local isLoadOldCooldown = false
+
+-- Variáveis de estado
+local mensagemRespondidaId, mensagemRespondidaNome = "", ""
+local sendCooldown = false	
+local mensagensCriadas = {}
+local ultimaMsgTimestamp = 0
+
+-- NOVO: Variáveis de estado adicionais para o sistema de envio de mídia
+local isMediaPanelOpen = false 	-- Controla a visibilidade do painel suspenso
+local selectedMediaType = "" 	-- "Audio", "Imagem" ou ""
+local isIdValidForSending = false -- NOVO: Estado de validade do ID (incluindo Asset Check)
+
+-- Variáveis de estado para o Preview de Mídia (NOVO)
+local previewSound = nil -- Objeto Sound para o preview
+local previewUpdateConnection = nil -- Conexão do Heartbeat para o preview
+local isPreviewPlaying = false -- Estado do player de preview
+local lastCheckedMediaId = "" -- NOVO: Rastreia o último ID que teve a prévia iniciada.
+
+-- Níveis de comando (Assumindo que estão definidos)
+local NIVEIS_COMANDO = {
+	["/clear"] = "ADM",
+	["/ban"] = "ADM"
+}	
+
+-- =====================
+-- CONFIGURAÇÕES DE ESTILO E MÍDIA
+-- =====================
+local COR_FUNDO_PRINCIPAL = Color3.fromRGB(24, 25, 26)
+local COR_SUPERFICIE = Color3.fromRGB(36, 37, 38)
+local COR_MENSAGEM = Color3.fromRGB(50, 51, 52)
+local COR_RESPOSTA = Color3.fromRGB(60, 61, 62)
+local COR_BOTAO_PRIMARIO = Color3.fromRGB(0, 150, 255)
+local COR_TEXTO = Color3.fromRGB(220, 221, 222)
+local COR_DESTAQUE = Color3.fromRGB(255, 170, 0)
+local RAIO_CANTO_GRANDE = 10
+local RAIO_CANTO_PEQUENO = 8
+
+-- IDs de ícones (padrão Roblox para Play/Pause)
+local ICON_PLAY = "rbxassetid://12008449041" -- Ícone de Play (Triângulo)
+local ICON_PAUSE = "rbxassetid://99514193135085" -- Ícone de Pause (Duas linhas)
+
+-- CONSTANTES DE PRÉVIA
+local INVALID_ASSET_IMAGE_ID = "rbxassetid://97343154385196"
+local PREVIEW_SIZE = UDim2.new(0, 200, 0, 200) -- Imagem de 200x200
+local ERROR_IMAGE_SIZE = UDim2.new(0, 100, 0, 100) -- Imagem de erro 100x100
+
+-- ==========================================================
+-- INICIALIZAÇÃO DA GUI E ESTRUTURA
+-- ==========================================================
+local playerGui = nil
+repeat
+    playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+    if not playerGui then
+        task.wait(0.1)
+    end
+until playerGui
+
+local oldGui = playerGui:FindFirstChild("ChatGlobalGUI")
+if oldGui and oldGui.Destroy then
+    oldGui:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "ChatGlobalGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = playerGui
+
+-- FRAME PRINCIPAL (JANELA DO CHAT)
+local Frame = Instance.new("Frame", ScreenGui)
+Frame.Size = UDim2.new(0, 420, 0, 500)
+Frame.Position = UDim2.new(0.5, -210, 0.5, -250)
+Frame.BackgroundColor3 = COR_SUPERFICIE
+Frame.Active = true
+Frame.Draggable = true
+Frame.BorderSizePixel = 0
+
+local UICorner_Frame = Instance.new("UICorner", Frame)
+UICorner_Frame.CornerRadius = UDim.new(0, RAIO_CANTO_GRANDE)
+
+local UIStroke_Frame = Instance.new("UIStroke", Frame)
+UIStroke_Frame.Thickness = 1
+UIStroke_Frame.Color = Color3.fromRGB(0, 0, 0)
+UIStroke_Frame.Transparency = 0.5
+UIStroke_Frame.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+-- ==========================================================
+-- TELA DE CARREGAMENTO (LOADING FRAME) - NOVO
+-- ==========================================================
+loadingFrame = Instance.new("Frame", Frame)
+loadingFrame.Name = "LoadingOverlay"
+loadingFrame.Size = UDim2.new(1, 0, 1, 0)
+loadingFrame.Position = UDim2.new(0, 0, 0, 0)
+loadingFrame.BackgroundColor3 = COR_SUPERFICIE:Lerp(Color3.new(0,0,0), 0.2) -- Fundo ligeiramente mais escuro
+loadingFrame.BorderSizePixel = 0
+loadingFrame.ZIndex = 10 -- Garante que cubra todos os elementos internos
+
+-- Título de Loading
+local LoadingTitle = Instance.new("TextLabel", loadingFrame)
+LoadingTitle.Size = UDim2.new(1, -20, 0, 30)
+LoadingTitle.Position = UDim2.new(0, 10, 0.5, -100)
+LoadingTitle.Text = "Carregando Chat Global 💬"
+LoadingTitle.TextColor3 = COR_TEXTO
+LoadingTitle.BackgroundTransparency = 1
+LoadingTitle.ZIndex = 11
+LoadingTitle.Font = Enum.Font.SourceSansBold
+LoadingTitle.TextSize = 25
+
+-- Status (Descrição)
+local StatusLabel = Instance.new("TextLabel", loadingFrame)
+StatusLabel.Name = "StatusLabel"
+StatusLabel.Size = UDim2.new(1, -40, 0, 20)
+StatusLabel.Position = UDim2.new(0, 20, 0.5, -50)
+StatusLabel.Text = "Inicializando Sistema..." -- Estado inicial
+StatusLabel.TextColor3 = COR_DESTAQUE
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.ZIndex = 11
+StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusLabel.Font = Enum.Font.SourceSans
+StatusLabel.TextSize = 16
+
+-- ProgressBar Container
+local ProgressBar = Instance.new("Frame", loadingFrame)
+ProgressBar.Name = "ProgressBar"
+ProgressBar.Size = UDim2.new(1, -40, 0, 10)
+ProgressBar.Position = UDim2.new(0, 20, 0.5, -20)
+ProgressBar.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+ProgressBar.ZIndex = 11
+ProgressBar.BorderSizePixel = 0
+
+local UICorner_Bar = Instance.new("UICorner", ProgressBar)
+UICorner_Bar.CornerRadius = UDim.new(0, 5)
+
+-- ProgressBar Fill (A cor primária animada)
+local ProgressFill = Instance.new("Frame", ProgressBar)
+ProgressFill.Name = "ProgressFill"
+ProgressFill.Size = UDim2.new(0, 0, 1, 0) -- Começa em 0
+ProgressFill.Position = UDim2.new(0, 0, 0, 0)
+ProgressFill.BackgroundColor3 = COR_BOTAO_PRIMARIO
+ProgressFill.ZIndex = 11
+ProgressFill.BorderSizePixel = 0
+
+local UICorner_Fill = Instance.new("UICorner", ProgressFill)
+UICorner_Fill.CornerRadius = UDim.new(0, 5)
+
+-- Percentage Label
+local ProgressLabel = Instance.new("TextLabel", loadingFrame)
+ProgressLabel.Name = "ProgressLabel"
+ProgressLabel.Size = UDim2.new(1, -40, 0, 20)
+ProgressLabel.Position = UDim2.new(0, 20, 0.5, 5)
+ProgressLabel.Text = "0%"
+ProgressLabel.TextColor3 = COR_TEXTO
+ProgressLabel.BackgroundTransparency = 1
+ProgressLabel.ZIndex = 11
+ProgressLabel.Font = Enum.Font.SourceSansBold
+ProgressLabel.TextSize = 15
+
+UpdateLoadingStatus(0, "Inicializando sistema (UI, Variáveis, Serviços...)", 1) -- Estado inicial
+
+-- Fim da Tela de Carregamento
+
+-- HEADER (TÍTULO E DECORAÇÃO)
+local HeaderFrame = Instance.new("Frame", Frame)
+HeaderFrame.Size = UDim2.new(1, 0, 0, 40)
+HeaderFrame.Position = UDim2.new(0, 0, 0, 0)
+HeaderFrame.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+HeaderFrame.BorderSizePixel = 0
+
+local UICorner_Header = Instance.new("UICorner", HeaderFrame)
+UICorner_Header.CornerRadius = UDim.new(0, RAIO_CANTO_GRANDE)
+
+local TitleLabel = Instance.new("TextLabel", HeaderFrame)
+TitleLabel.Size = UDim2.new(1, -20, 1, 0)
+TitleLabel.Position = UDim2.new(0, 10, 0, 0)
+TitleLabel.Text = "🌐 Chat Global"
+TitleLabel.TextColor3 = COR_TEXTO
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Font = Enum.Font.SourceSansBold
+TitleLabel.TextSize = 22
+
+-- SCROLLING FRAME (ÁREA DE MENSAGENS)
+local ScrollingFrame = Instance.new("ScrollingFrame", Frame)
+ScrollingFrame.Size = UDim2.new(1, -10, 1, -135) 
+ScrollingFrame.Position = UDim2.new(0, 5, 0, 45) 
+ScrollingFrame.BackgroundColor3 = COR_SUPERFICIE
+ScrollingFrame.BackgroundTransparency = 1 
+ScrollingFrame.ScrollBarThickness = 6
+ScrollingFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+ScrollingFrame.ScrollBarImageColor3 = Color3.fromRGB(50, 50, 50)
+ScrollingFrame.VerticalScrollBarPosition = Enum.VerticalScrollBarPosition.Right 
+
+local UIListLayout = Instance.new("UIListLayout", ScrollingFrame)
+UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+UIListLayout.Padding = UDim.new(0, 6) 
+UIListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+UIListLayout.FillDirection = Enum.FillDirection.Vertical
+
+-- BOTÃO CARREGAR MAIS (LOAD OLD)
+local LoadOld = Instance.new("TextButton")
+LoadOld.Size = UDim2.new(1, 0, 0, 30)
+LoadOld.Text = "🕓 Carregar mais mensagens"
+LoadOld.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+LoadOld.TextColor3 = COR_DESTAQUE
+LoadOld.Font = Enum.Font.SourceSansBold
+LoadOld.TextSize = 16
+LoadOld.LayoutOrder = -9999999 
+LoadOld.Parent = ScrollingFrame
+
+local UICorner_LoadOld = Instance.new("UICorner", LoadOld)
+UICorner_LoadOld.CornerRadius = UDim.new(0, RAIO_CANTO_PEQUENO)
+
+-- ÁREA DE RESPOSTA (RESPOSTAFRAME)
+local RespostaFrame = Instance.new("Frame", Frame)
+RespostaFrame.Size = UDim2.new(1, -10, 0, 30)
+RespostaFrame.Position = UDim2.new(0, 5, 1, -85) 
+RespostaFrame.BackgroundColor3 = COR_RESPOSTA
+RespostaFrame.Visible = false
+RespostaFrame.BorderSizePixel = 0
+
+local UICorner_Resposta = Instance.new("UICorner", RespostaFrame)
+UICorner_Resposta.CornerRadius = UDim.new(0, RAIO_CANTO_PEQUENO)
+
+local RespostaLabel = Instance.new("TextLabel", RespostaFrame)
+RespostaLabel.Size = UDim2.new(1, -35, 1, 0)
+RespostaLabel.Position = UDim2.new(0, 8, 0, 0) 
+RespostaLabel.TextColor3 = Color3.fromRGB(150, 150, 150) 
+RespostaLabel.BackgroundTransparency = 1
+RespostaLabel.TextXAlignment = Enum.TextXAlignment.Left
+RespostaLabel.Font = Enum.Font.SourceSansItalic
+RespostaLabel.TextSize = 15
+
+local CancelarResposta = Instance.new("TextButton", RespostaFrame)
+CancelarResposta.Size = UDim2.new(0, 20, 0, 20)
+CancelarResposta.Position = UDim2.new(1, -28, 0.5, -10)
+CancelarResposta.Text = "✖"
+CancelarResposta.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+CancelarResposta.TextColor3 = Color3.fromRGB(255, 255, 255)
+CancelarResposta.Font = Enum.Font.SourceSansBold
+CancelarResposta.TextSize = 16
+
+local UICorner_Cancelar = Instance.new("UICorner", CancelarResposta)
+UICorner_Cancelar.CornerRadius = UDim.new(0, 5)
+
+-- NOVO: BOTÃO DE MÍDIA
+local MediaButton = Instance.new("ImageButton", Frame)
+MediaButton.Size = UDim2.new(0, 40, 0, 40)
+MediaButton.Position = UDim2.new(0, 5, 1, -45) -- Posição: 5px da esquerda
+MediaButton.Image = "rbxassetid://9172244866" -- Ícone de Anexo/Mídia
+MediaButton.BackgroundColor3 = COR_FUNDO_PRINCIPAL:Lerp(Color3.new(0,0,0), 0.1)
+MediaButton.BackgroundTransparency = 1
+MediaButton.ScaleType = Enum.ScaleType.Fit
+MediaButton.ZIndex = 2
+MediaButton.Active = true -- ATIVO SEMPRE, pois apenas abre a interface.
+
+local UICorner_Media = Instance.new("UICorner", MediaButton)
+UICorner_Media.CornerRadius = UDim.new(0, 20)
+
+-- TEXTBOX (INPUT) - POSIÇÃO E TAMANHO AJUSTADOS PARA ABRIR ESPAÇO
+local TextBox = Instance.new("TextBox", Frame)
+TextBox.Size = UDim2.new(1, -140, 0, 40) -- Reduz a largura (100% - 140px)
+TextBox.Position = UDim2.new(0, 50, 1, -45) -- Move 50px para a direita (5 + 40 do botão + 5 de margem)
+TextBox.PlaceholderText = "Digite sua mensagem..."
+TextBox.Text = ""
+TextBox.TextColor3 = COR_TEXTO
+TextBox.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+TextBox.ClearTextOnFocus = false
+TextBox.TextSize = 16
+TextBox.Font = Enum.Font.SourceSans
+TextBox.BorderSizePixel = 0
+TextBox.TextEditable = false -- Bloqueado até o carregamento
+
+local UICorner_TextBox = Instance.new("UICorner", TextBox)
+UICorner_TextBox.CornerRadius = UDim.new(0, 20)
+
+-- ==========================================================
+-- MINI PAINEL REUTILIZÁVEL (CORRIGIDO: BLOQUEIO FORÇADO DO TEXTBOX)
+-- ==========================================================
+local function CriarMiniPainel(titulo, linhas)
+	local painel = Instance.new("ScrollingFrame")
+	painel.Name = "MiniPainel"
+	painel.Size = UDim2.new(0, 240, 0, 10)
+	painel.AutomaticSize = Enum.AutomaticSize.Y
+	painel.Position = UDim2.new(0.5, 0, 1.5, 0)
+	painel.AnchorPoint = Vector2.new(0.5, 0.5)
+	painel.BackgroundColor3 = COR_SUPERFICIE:Lerp(Color3.new(0,0,0), 0.1)
+	painel.BorderSizePixel = 0
+	painel.Visible = true
+	painel.ZIndex = 10
+	painel.Parent = Frame
+	painel.ScrollBarThickness = 6
+	painel.CanvasSize = UDim2.new(0, 0, 0, 0)
+	painel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	painel.ClipsDescendants = true
+
+    -- Array para rastrear e controlar elementos
+    local elementosControlados = {} 
+    
+    -- Cores para o estado de bloqueio 
+    local COR_BLOQUEADA = COR_TEXTO:Lerp(Color3.new(0,0,0), 0.5) 
+    local COR_FUNDO_BLOQUEADO = Color3.fromRGB(40, 40, 40) 
+
+
+	-- Limite de altura
+	local MAX_HEIGHT = 260
+	painel:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+		if painel.AbsoluteCanvasSize.Y > MAX_HEIGHT then
+			painel.AutomaticSize = Enum.AutomaticSize.None
+			painel.Size = UDim2.new(0, 240, 0, MAX_HEIGHT)
+		end
+	end)
+
+	local UICorner = Instance.new("UICorner", painel)
+	UICorner.CornerRadius = UDim.new(0, RAIO_CANTO_PEQUENO)
+
+	-- Layout principal
+	local layout = Instance.new("UIListLayout", painel)
+	layout.Padding = UDim.new(0, 5)
+	layout.FillDirection = Enum.FillDirection.Vertical
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+	local UIPadding_Panel = Instance.new("UIPadding", painel)
+	UIPadding_Panel.PaddingTop = UDim.new(0, 5)
+	UIPadding_Panel.PaddingBottom = UDim.new(0, 5)
+
+	-- Animação de entrada
+    painel.BackgroundTransparency = 1
+	painel.Transparency = 1
+	TweenService:Create(painel, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		BackgroundTransparency = 0,
+		Transparency = 0
+	}):Play()
+
+	-- Função de fechar
+	local function FecharPainel()
+		TweenService:Create(painel, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+			Position = UDim2.new(0.5, 0, 1.5, 0),
+			BackgroundTransparency = 1,
+			Transparency = 1
+		}):Play()
+		task.delay(0.3, function() painel:Destroy() end)
+	end
+
+	-- Função para Limpar o Conteúdo do Painel e redefinir o título
+    local function LimparConteudo(novoTitulo)
+        for _, child in ipairs(painel:GetChildren()) do
+            if child:IsA("Frame") or (child:IsA("TextLabel") and child.LayoutOrder ~= 0) or child:IsA("TextButton") then
+                child:Destroy()
+            end
+        end
+
+		local tituloLbl = painel:FindFirstChild("PanelTitle")
+		
+		if not tituloLbl then
+			tituloLbl = Instance.new("TextLabel", painel)
+			tituloLbl.Name = "PanelTitle" 
+			tituloLbl.Size = UDim2.new(1, -20, 0, 30)
+			tituloLbl.TextColor3 = COR_TEXTO
+			tituloLbl.BackgroundTransparency = 1
+			tituloLbl.Font = Enum.Font.SourceSansBold
+			tituloLbl.TextSize = 20
+			tituloLbl.ZIndex = 11
+			tituloLbl.LayoutOrder = 0 
+		end
+		
+        tituloLbl.Text = novoTitulo or "Painel"
+        
+        painel.AutomaticSize = Enum.AutomaticSize.None 
+        painel.Size = UDim2.new(0, 240, 0, 40) 
+        
+        painel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        painel.CanvasSize = UDim2.new(0, 0, 0, 0)
+        
+        local originalSortOrder = layout.SortOrder
+        layout.SortOrder = Enum.SortOrder.Name 
+        layout.SortOrder = originalSortOrder 
+        
+        painel.AutomaticSize = Enum.AutomaticSize.Y
+    end
+    
+    LimparConteudo(titulo)
+
+    -- NOVO: Função para bloquear/desbloquear todos os elementos controlados
+    local function BloquearElementos(deveBloquear)
+        
+        for _, itemData in ipairs(elementosControlados) do
+            local obj = itemData.Obj
+            local tipo = itemData.Tipo
+            local corOriginalTexto = itemData.CorOriginal or COR_TEXTO 
+
+            if tipo == "Botao" then
+                -- Botão: Desativa e escurece o fundo
+                obj.Active = not deveBloquear
+                obj.BackgroundColor3 = deveBloquear and COR_FUNDO_BLOQUEADO or itemData.CorOriginalFundo 
+                obj.TextColor3 = deveBloquear and COR_BLOQUEADA or Color3.new(1,1,1)
+
+            elseif tipo == "TextBox" then
+                local Hitbox = itemData.ObjHitbox
+                
+                -- CORREÇÃO FINAL: BLOQUEIO TRIPLO E SEGURO:
+                Hitbox.Active = deveBloquear          -- 1. Hitbox (ZIndex 20): Captura cliques/toques
+                obj.Selectable = not deveBloquear     -- 2. Selectable: Impede foco via Tab
+                obj.TextEditable = not deveBloquear   -- 3. TextEditable: Impede input de texto
+                
+                -- Controle Visual
+                local targetColor = deveBloquear and COR_BLOQUEADA or corOriginalTexto
+                obj.TextColor3 = targetColor
+                obj.PlaceholderColor3 = targetColor
+
+            elseif tipo == "Switch" then
+                -- Switch: Desativa Hitbox e escurece ambos os textos
+                itemData.ObjHitbox.Active = not deveBloquear
+                
+                local targetColor = deveBloquear and COR_BLOQUEADA or corOriginalTexto
+                
+                -- Label
+                itemData.ObjSwitchLabel.TextColor3 = targetColor
+
+                -- CheckBox
+                if deveBloquear then
+                    itemData.ObjCheckBox.TextColor3 = COR_BLOQUEADA
+                else
+                    local isAtivo = itemData.ObjCheckBox.Text == "[☑️]"
+                    itemData.ObjCheckBox.TextColor3 = isAtivo and COR_DESTAQUE or corOriginalTexto
+                end
+                
+            elseif tipo == "Texto" or tipo == "Subtitulo" then
+                -- Textos/Subtítulos: Apenas escurece o texto
+                obj.TextColor3 = deveBloquear and COR_BLOQUEADA or corOriginalTexto
+            end
+        end
+    end
+    
+	-- Define o objeto de controle que será retornado
+    local controlObject = {
+        painel = painel, 
+        Fechar = FecharPainel, 
+        Limpar = LimparConteudo,
+        Bloquear = BloquearElementos 
+    }
+
+
+	-- Criação das linhas 
+	local ordem = 1 
+    
+	for _, linha in ipairs(linhas) do
+		local linhaFrame = Instance.new("Frame", painel)
+		linhaFrame.Size = UDim2.new(1, -10, 0, 40)
+		linhaFrame.BackgroundTransparency = 1
+		linhaFrame.LayoutOrder = ordem
+		ordem += 1
+
+		local linhaLayout = Instance.new("UIListLayout", linhaFrame)
+		linhaLayout.FillDirection = Enum.FillDirection.Horizontal
+		linhaLayout.Padding = UDim.new(0, 5)
+		linhaLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+		local tiposUsados = {}
+		for _, item in ipairs(linha) do
+			local tipo, texto, callback = item.Tipo, item.Texto or "", item.Funcao
+
+			if tipo == "Botao" then
+				local botao = Instance.new("TextButton", linhaFrame)
+				botao.Size = UDim2.new(0.5, -5, 1, 0)
+				botao.Text = texto
+				botao.BackgroundColor3 = COR_BOTAO_PRIMARIO
+				botao.TextColor3 = Color3.new(1,1,1)
+				botao.Font = Enum.Font.SourceSansBold
+				botao.TextSize = 16
+				botao.ZIndex = 11
+				local u = Instance.new("UICorner", botao)
+				u.CornerRadius = UDim.new(0, 8)
+				if callback then
+					botao.MouseButton1Click:Connect(function()
+						callback(controlObject) 
+					end)
+				end
+                table.insert(elementosControlados, {Obj = botao, Tipo = "Botao", CorOriginalFundo = COR_BOTAO_PRIMARIO})
+
+
+			elseif not tiposUsados[tipo] then
+				tiposUsados[tipo] = true
+				if tipo == "TextBox" then
+					
+					local TextBoxContainer = Instance.new("Frame", linhaFrame)
+					TextBoxContainer.Size = UDim2.new(1, -10, 1, 0) 
+					TextBoxContainer.BackgroundTransparency = 1
+					
+					local box = Instance.new("TextBox", TextBoxContainer)
+					box.Size = UDim2.new(1, 0, 1, 0) 
+					box.PlaceholderText = texto
+					box.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+					box.TextColor3 = COR_TEXTO
+					box.Font = Enum.Font.SourceSans
+					box.Text = ""
+					box.TextSize = 16
+					box.ZIndex = 11 
+					box.ClearTextOnFocus = false
+                    box.Selectable = true -- Inicia selecionável
+                    box.TextEditable = true -- NOVO: Inicia editável
+					local u = Instance.new("UICorner", box)
+					u.CornerRadius = UDim.new(0, 8)
+                    
+                    local Hitbox = Instance.new("TextButton", TextBoxContainer)
+                    Hitbox.Name = "Hitbox"
+                    Hitbox.Size = UDim2.new(1, 0, 1, 0) 
+                    Hitbox.Position = UDim2.new(0, 0, 0, 0)
+                    Hitbox.BackgroundTransparency = 1
+                    Hitbox.Text = "" 
+                    Hitbox.ZIndex = 20 
+                    Hitbox.Active = false 
+                    
+                    Hitbox.MouseButton1Click:Connect(function() 
+                        if Hitbox.Active then 
+                            box:ReleaseFocus()
+                        end
+                    end)
+                    
+                    -- Removendo box.Focused:Connect
+                    -- box.Focused:Connect(function()
+                    --    if Hitbox.Active then
+                    --        box:ReleaseFocus()
+                    --    end
+                    -- end)
+
+                    table.insert(elementosControlados, {Obj = box, Tipo = "TextBox", CorOriginal = COR_TEXTO, ObjHitbox = Hitbox})
+
+
+				elseif tipo == "Subtitulo" then
+					local lbl = Instance.new("TextLabel", linhaFrame)
+					lbl.Size = UDim2.new(1, -10, 0, 25)
+					lbl.Text = texto
+					lbl.TextColor3 = Color3.fromRGB(220, 220, 220) 
+					lbl.BackgroundTransparency = 1
+					lbl.TextXAlignment = Enum.TextXAlignment.Left
+					lbl.Font = Enum.Font.SourceSansBold
+					lbl.TextSize = 16
+					lbl.ZIndex = 11
+                    table.insert(elementosControlados, {Obj = lbl, Tipo = "Subtitulo", CorOriginal = Color3.fromRGB(220, 220, 220)})
+
+				elseif tipo == "Texto" then
+					local lbl = Instance.new("TextLabel", linhaFrame)
+					lbl.Size = UDim2.new(1, -10, 0, 25)
+					lbl.Text = texto
+					lbl.TextColor3 = Color3.fromRGB(255, 255, 255) 
+					lbl.BackgroundTransparency = 1
+					lbl.TextXAlignment = Enum.TextXAlignment.Center
+					lbl.Font = Enum.Font.SourceSans
+					lbl.TextSize = 16
+					lbl.ZIndex = 11
+                    table.insert(elementosControlados, {Obj = lbl, Tipo = "Texto", CorOriginal = Color3.fromRGB(255, 255, 255)})
+                    
+				elseif tipo == "Switch" then
+					
+					local isAtivo = item.EstadoInicial or false
+					
+					local SwitchFrame = Instance.new("Frame", linhaFrame)
+					SwitchFrame.Size = UDim2.new(1, -10, 1, 0)
+					SwitchFrame.BackgroundTransparency = 1
+					SwitchFrame.LayoutOrder = 1 
+					
+					local CheckBox = Instance.new("TextLabel", SwitchFrame)
+					CheckBox.Name = "CheckBox"
+					CheckBox.Size = UDim2.new(0, 30, 1, 0) 
+					CheckBox.Position = UDim2.new(0, 5, 0, 0) 
+					CheckBox.Text = isAtivo and "[☑️]" or "[     ]"
+					CheckBox.TextColor3 = isAtivo and COR_DESTAQUE or COR_TEXTO 
+					CheckBox.BackgroundTransparency = 1
+					CheckBox.Font = Enum.Font.SourceSansBold
+					CheckBox.TextSize = 20
+					CheckBox.TextXAlignment = Enum.TextXAlignment.Center
+					CheckBox.ZIndex = 11 
+					
+					local SwitchLabel = Instance.new("TextLabel", SwitchFrame)
+					SwitchLabel.Name = "SwitchLabel"
+					SwitchLabel.Size = UDim2.new(1, -40, 1, 0) 
+					SwitchLabel.Position = UDim2.new(0, 35, 0, 0) 
+					SwitchLabel.Text = texto
+					SwitchLabel.TextColor3 = COR_TEXTO
+					SwitchLabel.BackgroundTransparency = 1
+					SwitchLabel.TextXAlignment = Enum.TextXAlignment.Left
+					SwitchLabel.Font = Enum.Font.SourceSans
+					SwitchLabel.TextSize = 16
+					SwitchLabel.ZIndex = 11 
+					
+					local function UpdateSwitch(novoEstado)
+						isAtivo = novoEstado
+						CheckBox.Text = isAtivo and "[☑️]" or "[     ]"
+						CheckBox.TextColor3 = isAtivo and COR_DESTAQUE or COR_TEXTO
+					end
+					
+					local Hitbox = Instance.new("TextButton", SwitchFrame)
+					Hitbox.Size = UDim2.new(1, 0, 1, 0)
+					Hitbox.Position = UDim2.new(0, 0, 0, 0) 
+					Hitbox.BackgroundTransparency = 1
+					Hitbox.Text = "" 
+					Hitbox.ZIndex = 15 
+					
+					if callback then
+						Hitbox.MouseButton1Click:Connect(function()
+                            if Hitbox.Active then 
+                                local novoEstado = not isAtivo
+                                UpdateSwitch(novoEstado)
+                                callback(novoEstado, controlObject) 
+                            end
+						end)
+					end
+                    
+                    table.insert(elementosControlados, {
+                        Tipo = "Switch",
+                        ObjHitbox = Hitbox, 
+                        ObjCheckBox = CheckBox,
+                        ObjSwitchLabel = SwitchLabel,
+                        CorOriginal = COR_TEXTO 
+                    })
+					
+				end
+			end
+		end
+	end
+
+	return controlObject
+end
+
+-- NOVO: MINI PAINEL SUSPENSO (MediaPanel)
+local MediaPanel = Instance.new("Frame", Frame)
+MediaPanel.Name = "MediaPanel"
+MediaPanel.Size = UDim2.new(0, 240, 0, 10) -- CORRIGIDO: Altura inicial mínima (10px) para forçar o AutomaticSize.Y a calcular corretamente ao se tornar visível.
+MediaPanel.AutomaticSize = Enum.AutomaticSize.Y -- NOVO: Ajusta a altura automaticamente
+MediaPanel.Position = UDim2.new(0.5, 0, 0.5, 0) -- NOVO: Centraliza no meio da tela
+MediaPanel.AnchorPoint = Vector2.new(0.5, 0.5) -- NOVO: Define o ponto de referência para o centro
+MediaPanel.BackgroundColor3 = COR_SUPERFICIE:Lerp(Color3.new(0,0,0), 0.1)
+MediaPanel.BorderSizePixel = 0
+MediaPanel.Visible = false
+MediaPanel.ZIndex = 3
+
+local UICorner_Panel = Instance.new("UICorner", MediaPanel)
+UICorner_Panel.CornerRadius = UDim.new(0, RAIO_CANTO_PEQUENO)
+
+local UIListLayout_Panel = Instance.new("UIListLayout", MediaPanel)
+UIListLayout_Panel.Padding = UDim.new(0, 5)
+UIListLayout_Panel.HorizontalAlignment = Enum.HorizontalAlignment.Center
+UIListLayout_Panel.VerticalAlignment = Enum.VerticalAlignment.Top
+UIListLayout_Panel.FillDirection = Enum.FillDirection.Vertical
+
+local UIPadding_Panel = Instance.new("UIPadding", MediaPanel)
+UIPadding_Panel.PaddingTop = UDim.new(0, 5)
+
+-- [TELA 1] TÍTULO SOLICITADO
+local PanelTitle = Instance.new("TextLabel", MediaPanel)
+PanelTitle.Name = "PanelTitle"
+PanelTitle.Size = UDim2.new(1, 0, 0, 30)
+PanelTitle.Text = "Escolha para enviar"
+PanelTitle.TextColor3 = COR_TEXTO
+PanelTitle.BackgroundTransparency = 1
+PanelTitle.ZIndex = 4
+PanelTitle.Font = Enum.Font.SourceSansBold
+PanelTitle.TextSize = 20
+PanelTitle.LayoutOrder = 1 -- NOVO: Garante o topo
+
+-- [TELA 1] OPÇÕES DE MÍDIA
+local OptionsFrame = Instance.new("Frame", MediaPanel)
+OptionsFrame.Size = UDim2.new(1, -10, 0, 40)
+OptionsFrame.BackgroundTransparency = 1
+OptionsFrame.Name = "OptionsFrame"
+OptionsFrame.LayoutOrder = 2 -- NOVO
+
+local UIListLayout_Options = Instance.new("UIListLayout", OptionsFrame)
+UIListLayout_Options.FillDirection = Enum.FillDirection.Horizontal
+UIListLayout_Options.HorizontalAlignment = Enum.HorizontalAlignment.Center
+UIListLayout_Options.Padding = UDim.new(0, 5)
+
+local AudioButton = Instance.new("TextButton", OptionsFrame)
+AudioButton.Name = "Audio"
+AudioButton.Size = UDim2.new(0.5, -7.5, 1, 0)
+AudioButton.Text = "🎵 Áudio"
+AudioButton.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+AudioButton.TextColor3 = COR_TEXTO
+AudioButton.ZIndex = 3
+AudioButton.Font = Enum.Font.SourceSansBold
+AudioButton.TextSize = 16
+
+local ImageButton = Instance.new("TextButton", OptionsFrame)
+ImageButton.Name = "Imagem"
+ImageButton.Size = UDim2.new(0.5, -7.5, 1, 0)
+ImageButton.Text = "🖼️ Imagem"
+ImageButton.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+ImageButton.ZIndex = 3
+ImageButton.TextColor3 = COR_TEXTO
+ImageButton.Font = Enum.Font.SourceSansBold
+ImageButton.TextSize = 16
+
+-- [TELA 2] CAMPO DE ID
+local IdTextBox = Instance.new("TextBox", MediaPanel)
+IdTextBox.Name = "IdTextBox"
+IdTextBox.Size = UDim2.new(1, -10, 0, 30)
+IdTextBox.PlaceholderText = "Selecione Imagem ou Áudio acima..."
+IdTextBox.Text = ""
+IdTextBox.TextColor3 = COR_TEXTO
+IdTextBox.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+IdTextBox.ZIndex = 3
+IdTextBox.ClearTextOnFocus = false
+IdTextBox.TextSize = 16
+IdTextBox.Font = Enum.Font.SourceSans
+IdTextBox.BorderSizePixel = 0
+IdTextBox.TextEditable = false
+IdTextBox.Visible = false -- Inicia invisível
+IdTextBox.LayoutOrder = 3 -- NOVO
+
+local UICorner_IdBox = Instance.new("UICorner", IdTextBox)
+UICorner_IdBox.CornerRadius = UDim.new(0, 8)
+
+-- NOVO: CONTAINER DE PRÉ-VISUALIZAÇÃO (PreviewContainer)
+local PreviewContainer = Instance.new("Frame", MediaPanel)
+PreviewContainer.Name = "PreviewContainer"
+PreviewContainer.Size = UDim2.new(1, -10, 0, 0) -- Altura inicial 0, será ajustado pelo conteúdo
+PreviewContainer.BackgroundTransparency = 1
+PreviewContainer.Visible = false -- Inicia invisível
+PreviewContainer.LayoutOrder = 4 -- NOVO
+
+local UIPadding_Preview = Instance.new("UIPadding", PreviewContainer)
+UIPadding_Preview.PaddingTop = UDim.new(0, 5)
+UIPadding_Preview.PaddingBottom = UDim.new(0, 5)
+-- Adiciona um UIListLayout para centralizar ou organizar o conteúdo da preview
+local UIListLayout_Preview = Instance.new("UIListLayout", PreviewContainer)
+UIListLayout_Preview.HorizontalAlignment = Enum.HorizontalAlignment.Center
+UIListLayout_Preview.VerticalAlignment = Enum.VerticalAlignment.Top
+UIListLayout_Preview.FillDirection = Enum.FillDirection.Vertical
+UIListLayout_Preview.Padding = UDim.new(0, 5)
+
+
+-- [TELA 2] BOTÕES DE AÇÃO (Confirmar/Cancelar)
+local ActionFrame = Instance.new("Frame", MediaPanel)
+ActionFrame.Size = UDim2.new(1, -10, 0, 30)
+ActionFrame.BackgroundTransparency = 1
+ActionFrame.Name = "ActionFrame"
+ActionFrame.Visible = false -- Inicia invisível
+ActionFrame.LayoutOrder = 5 -- NOVO
+
+local UIListLayout_Action = Instance.new("UIListLayout", ActionFrame)
+UIListLayout_Action.FillDirection = Enum.FillDirection.Horizontal
+UIListLayout_Action.HorizontalAlignment = Enum.HorizontalAlignment.Center
+UIListLayout_Action.Padding = UDim.new(0, 5)
+
+local ConfirmarButton = Instance.new("TextButton", ActionFrame)
+ConfirmarButton.Name = "Confirmar"
+ConfirmarButton.Size = UDim2.new(0.5, -7.5, 1, 0)
+ConfirmarButton.Text = "Confirmar"
+ConfirmarButton.BackgroundColor3 = COR_BOTAO_PRIMARIO
+ConfirmarButton.TextColor3 = Color3.new(1, 1, 1)
+ConfirmarButton.ZIndex = 3
+ConfirmarButton.Font = Enum.Font.SourceSansBold
+ConfirmarButton.TextSize = 16
+ConfirmarButton.Active = false -- Inicia Desativado (NOVO)
+
+local CancelarButton = Instance.new("TextButton", ActionFrame)
+CancelarButton.Name = "Cancelar"
+CancelarButton.Size = UDim2.new(0.5, -7.5, 1, 0)
+CancelarButton.Text = "Cancelar"
+CancelarButton.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+CancelarButton.TextColor3 = Color3.new(1, 1, 1)
+CancelarButton.ZIndex = 3
+CancelarButton.Font = Enum.Font.SourceSansBold
+CancelarButton.TextSize = 16
+
+-- Efeito de Foco (Tween/Stroke)
+local defaultStrokeColor = Color3.fromRGB(0, 0, 0)
+local focusStrokeColor = COR_BOTAO_PRIMARIO
+local defaultStroke = Instance.new("UIStroke", TextBox)
+defaultStroke.Thickness = 0.5
+defaultStroke.Color = defaultStrokeColor
+defaultStroke.Transparency = 1
+defaultStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+TextBox.Focused:Connect(function()
+    TweenService:Create(defaultStroke, TweenInfo.new(0.3), {Color = focusStrokeColor, Transparency = 0.2, Thickness = 1.5}):Play()
+end)
+TextBox.FocusLost:Connect(function(enterPressed)
+    TweenService:Create(defaultStroke, TweenInfo.new(0.3), {Color = defaultStrokeColor, Transparency = 1, Thickness = 0.5}):Play()
+    if enterPressed and isLoadingCompleted then EnviarMensagem(TextBox.Text) end -- Bloqueia durante o carregamento
+end)
+
+-- BOTÃO ENVIAR (SEND)
+local Enviar = Instance.new("TextButton", Frame)
+Enviar.Size = UDim2.new(0, 80, 0, 40)
+Enviar.Position = UDim2.new(1, -85, 1, -45)
+Enviar.Text = "Enviar"
+Enviar.BackgroundColor3 = COR_BOTAO_PRIMARIO
+Enviar.TextColor3 = Color3.fromRGB(255, 255, 255)
+Enviar.Font = Enum.Font.SourceSansBold
+Enviar.TextSize = 18
+Enviar.Active = false -- Bloqueado até o carregamento
+
+local UICorner_Enviar = Instance.new("UICorner", Enviar)
+UICorner_Enviar.CornerRadius = UDim.new(0, 20)
+
+-- Animação de Click/Hover
+local defaultColor = COR_BOTAO_PRIMARIO
+local hoverColor = defaultColor:Lerp(Color3.fromRGB(255, 255, 255), 0.1) 
+
+local function ButtonHover(obj, isHovering)
+    if isHovering and isLoadingCompleted then
+        TweenService:Create(obj, TweenInfo.new(0.1), {BackgroundColor3 = hoverColor}):Play()
+    else
+        TweenService:Create(obj, TweenInfo.new(0.1), {BackgroundColor3 = defaultColor}):Play()
+    end
+end
+
+InputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement and isLoadingCompleted then
+        local isHovering = (input.Target == Enviar)
+        ButtonHover(Enviar, isHovering)
+    end
+end)
+
+Enviar.MouseButton1Down:Connect(function()
+	if not isLoadingCompleted then return end
+	TweenService:Create(Enviar, TweenInfo.new(0.1), {BackgroundTransparency = 0.2}):Play()
+end)
+Enviar.MouseButton1Up:Connect(function()
+	if not isLoadingCompleted then return end
+	TweenService:Create(Enviar, TweenInfo.new(0.1), {BackgroundTransparency = 0}):Play()
+end)
+
+-- RESPOSTAS
+CancelarResposta.MouseButton1Click:Connect(function()
+	mensagemRespondidaId, mensagemRespondidaNome = "", ""
+	RespostaFrame.Visible = false
+end)
+
+-- ==========================================================
+-- FUNÇÃO PRINCIPAL DE ENVIO DE PAYLOAD COM VERIFICAÇÕES (UNIFICADA)
+-- ==========================================================
+
+local function CriarPunicaoRegistro(banDetails, messageID)
+	-- banDetails: table com TargetUserId, TargetName, ModeratorUserId, ModeratorName, Motivo, DurationMinutes, Timestamp
+	-- messageID: ID da mensagem de chat associada (opcional)
+	local payload = {
+		pagina = PUNICOES_SHEET_NAME,
+		TargetUserId = banDetails.TargetUserId,
+		TargetName = banDetails.TargetName,
+		ModeratorUserId = banDetails.ModeratorUserId,
+		ModeratorName = banDetails.ModeratorName,
+		Motivo = banDetails.Motivo,
+		DurationMinutes = banDetails.DurationMinutes,
+		Timestamp = banDetails.Timestamp or os.time(),
+		MessageID = messageID or "",
+		apikey = API_KEY
+	}
+	local ok, resp = pcall(function()
+		return http_request({
+			Url = url,
+			Method = "POST",
+			Headers = {["Content-Type"] = "application/json"},
+			Body = HttpService:JSONEncode(payload)
+		})
+	end)
+	return ok and resp and resp.Body
+end
+
+local function SendMessagePayload(tipo, dados, onComplete) -- NOVO: Adiciona onComplete
+	if not isLoadingCompleted then return "Loading" end -- Bloqueio Final
+	
+	-- Bloqueio se localmente punido
+	if isLocallyBanned then
+		if TextBox then
+			local original = TextBox.PlaceholderText
+			TextBox.PlaceholderText = "🔒 Você está punido e não pode enviar mensagens."
+			task.delay(2, function() TextBox.PlaceholderText = original end)
+		end
+		if onComplete then onComplete() end
+		return "Punido"
+	end
+
+	local originalTxt = ""
+	if tipo == "Audio" then originalTxt = "🎵 Áudio: " .. (dados.AudioId or "ID Inválido")
+	elseif tipo == "Imagem" then originalTxt = "🖼️ Imagem: " .. (dados.ImageId or "ID Inválido")
+	else
+		-- When Padrao, 'dados' might be a string (text) or a table (command data)
+		if type(dados) == "string" then
+			originalTxt = dados
+		elseif type(dados) == "table" then
+			-- if it's structured data (e.g. ban command), create a readable message
+			if dados.Command == "ban" or dados.Command == "/ban" then
+				originalTxt = string.format("/ban %s", dados.TargetName or "Unknown")
+			else
+				originalTxt = (dados.Text or "") 
+			end
+		end
+	end
+
+	if originalTxt == "" or sendCooldown then return "Cooldown" end
+
+	local requiredCooldown = GetPlayerCooldown()
+	local requiredMediaCooldown = VIP_MEDIA_COOLDOWN
+	local currentTime = os.time()
+	local playerClass = GetPlayerPermissionClass()
+	
+	local hasSufficientPermission = true
+	local isCooldown = false
+
+	-- 1. VERIFICAÇÃO DE PERMISSÃO E COOLDOWN POR TIPO (MÍDIA)
+	if tipo == "Audio" or tipo == "Imagem" then
+		if not IsPermissionSufficient("VIP") then
+			hasSufficientPermission = false
+		elseif playerClass ~= "DEV" and (currentTime - lastSentMediaTypeTime < requiredMediaCooldown) then
+			isCooldown = true
+		end
+	end
+
+	-- 2. VERIFICAÇÃO DE COMANDOS ESPECÍFICOS (/clear, /ban)
+	if tipo == "Padrao" and originalTxt:sub(1,1) == "/" then
+		-- Detect /ban structured payload
+		local isBanCommand = false
+		local banData = nil
+		if type(dados) == "table" and (dados.Command == "ban" or dados.Command == "/ban") then
+			isBanCommand = true
+			banData = dados
+		else
+			-- fallback: parse plain text like "/ban Name"
+			local partes = {}
+			for part in originalTxt:gmatch("[^%s]+") do table.insert(partes, part) end
+			local comandoNome = partes[1]:lower()
+			if comandoNome == "/ban" then
+				isBanCommand = true
+				banData = { Command = "ban", TargetName = partes[2] or "", ModeratorName = LocalPlayer.Name, ModeratorUserId = LocalPlayer.UserId }
+			end
+		end
+
+		if isBanCommand then
+			-- Only ADM or DEV can ban
+			if not IsPermissionSufficient("ADM") then
+				hasSufficientPermission = false
+			end
+			-- If everything ok, carry on with special handling below
+		else
+			local partes = {}
+			for part in originalTxt:gmatch("[^%s]+") do table.insert(partes, part) end
+			local comandoNome = partes[1]:lower()
+			local requiredCommandClass = NIVEIS_COMANDO[comandoNome]
+			if requiredCommandClass and not IsPermissionSufficient(requiredCommandClass) then
+				hasSufficientPermission = false
+			end
+		end
+	end
+	
+	-- 3. VERIFICAÇÃO DE COOLDOWN PADRÃO (Aplicado a mensagens Padrão e Comandos)
+	if tipo == "Padrao" then
+		if playerClass ~= "DEV" and (currentTime - lastSentTime < requiredCooldown) then
+			isCooldown = true
+		end
+	end
+	
+	-- TRATAMENTO LOCAL DO ERRO (ANULAR ENVIO HTTP)
+	local originalPlaceholder = TextBox.PlaceholderText
+	
+	if not hasSufficientPermission or isCooldown then
+		local requiredClass = "DEFAULT"
+		local errorMsg = ""
+		
+		if not hasSufficientPermission then
+			-- Tenta inferir a classe requerida para a mensagem de erro
+			if tipo == "Audio" or tipo == "Imagem" then requiredClass = "VIP"
+			elseif tipo == "Padrao" and originalTxt:sub(1,1) == "/" then
+				local partes = {}
+				for part in originalTxt:gmatch("[^%s]+") do table.insert(partes, part) end
+				requiredClass = NIVEIS_COMANDO[partes[1]:lower()] or "DEFAULT"
+			end
+			errorMsg = string.format("NEGADO: Requer %s (Seu: %s)", requiredClass, playerClass)
+		elseif isCooldown then
+			local timeLeft = 0
+			if tipo == "Audio" or tipo == "Imagem" then timeLeft = requiredMediaCooldown - (currentTime - lastSentMediaTypeTime)
+			else timeLeft = requiredCooldown - (currentTime - lastSentTime) end
+			errorMsg = string.format("Aguarde %.1f segundos! (Nível: %s)", timeLeft, playerClass)
+		end
+		
+		TextBox.PlaceholderText = errorMsg
+		task.delay(3, function() if TextBox.PlaceholderText ~= originalPlaceholder then TextBox.PlaceholderText = originalPlaceholder end end)
+		
+		if onComplete then onComplete() end -- Fecha o painel se a falha for local (e ele estiver aberto)
+		return "FalhaLocal"
+	end
+	
+	-- FASE DE ENVIO HTTP (SE TUDO PASSAR LOCALMENTE)
+	if tipo == "Padrao" then TextBox.Text = "" end
+
+	sendCooldown = true
+	Enviar.Text = "Enviando..."
+	TextBox.PlaceholderText = "..."
+	TextBox.TextEditable = false -- BLOQUEIA O TEXTBOX
+	
+	local messageID = HttpService:GenerateGUID(false)
+	local payload = {
+		pagina = DATA_SHEET_NAME, 	-- ChatGlobal
+		ID = messageID, 		
+		Player = LocalPlayer.Name,
+		UserId = LocalPlayer.UserId,
+		Mensagem = originalTxt, 	-- Texto resumido/padrão
+		Timestamp = currentTime,	
+		PlaceId = game.PlaceId,
+		RespostaDe = mensagemRespondidaId,
+		Tipo = tipo, 				-- Tipo de mensagem
+		Dados = "", -- Será setado abaixo
+		apikey = API_KEY	
+	}
+
+	-- Se for BAN estruturado (dados tabela), escreve Dados como JSON com tag Ban e cria registro em Punições
+	if tipo == "Padrao" and type(dados) == "table" and (dados.Command == "ban" or dados.Command == "/ban") then
+		-- Prepare banDetails
+		local banDetails = {
+			TargetName = dados.TargetName or "",
+			TargetUserId = tonumber(dados.TargetUserId) or nil,
+			ModeratorUserId = LocalPlayer.UserId,
+			ModeratorName = LocalPlayer.Name,
+			Motivo = dados.Motivo or (dados.Reason or "Sem motivo"),
+			DurationMinutes = tonumber(dados.DurationMinutes) or (dados.Duration or 0),
+			Timestamp = currentTime
+		}
+		-- If TargetUserId not provided, try to resolve by name
+		if not banDetails.TargetUserId and banDetails.TargetName and banDetails.TargetName ~= "" then
+			local ok, id = pcall(function() return Players:GetUserIdFromNameAsync(banDetails.TargetName) end)
+			if ok and tonumber(id) then banDetails.TargetUserId = tonumber(id) end
+		end
+
+		-- Salva Dados na mensagem do ChatGlobal como {Ban = banDetails}
+		payload.Dados = HttpService:JSONEncode({ Ban = banDetails })
+
+		-- Envia a mensagem (POST) para ChatGlobal com Dados contendo a punição
+		local success, response = pcall(function()
+			return http_request({
+				Url = url,
+				Method = "POST",
+				Headers = {["Content-Type"] = "application/json"},
+				Body = HttpService:JSONEncode(payload)
+			})
+		end)
+
+		-- Em paralelo cria uma entrada na aba Punições (Nova) para histórico
+		-- (A API_KEY é usada somente para escrita)
+		local okRecord = false
+		if success then
+			pcall(function()
+				CriarPunicaoRegistro(banDetails, messageID)
+			end)
+		else
+			warn("Falha ao postar mensagem de ban no ChatGlobal:", response)
+		end
+
+		-- Se o alvo for o local player, aplica ban local imediatamente
+		if banDetails.TargetUserId == LocalPlayer.UserId then
+			ApplyLocalBan(banDetails)
+		else
+			-- Exibe aviso administrativo local (somente visual)
+			local notice = Instance.new("TextLabel", ScrollingFrame)
+			notice.Size = UDim2.new(1, -20, 0, 20)
+			notice.BackgroundTransparency = 1
+			notice.TextColor3 = Color3.fromRGB(255, 170, 0)
+			notice.Text = string.format("⚠️ Moderation: %s foi punido por %s", banDetails.TargetName or "Um jogador", banDetails.Motivo or "Sem motivo")
+			notice.Font = Enum.Font.SourceSansItalic
+			notice.TextSize = 14
+			notice.LayoutOrder = currentTime
+			task.defer(function() ScrollingFrame.CanvasSize = UDim2.new(0,0,0,UIListLayout.AbsoluteContentSize.Y) end)
+		end
+
+		-- FIM DO ENVIO: ATUALIZA O COOLDOWN E CACHE
+		if success then
+			UpdatePlayerLastMessage(messageID, currentTime)
+			lastSentTime = os.time()
+		else
+			warn("Falha crítica ao enviar requisição HTTP. Cooldown não iniciado.")
+		end
+
+		if onComplete then onComplete() end
+
+		-- RESTAURA ESTADO DO UI
+		Enviar.Text = "Enviar"
+		TextBox.PlaceholderText = originalPlaceholder
+		TextBox.TextEditable = true -- DESBLOQUEIA O TEXTBOX
+		mensagemRespondidaId, mensagemRespondidaNome = "", ""
+		RespostaFrame.Visible = false
+	
+		task.delay(1, function() sendCooldown = false end)
+		return "Sucesso"
+	end
+	
+	-- Caso padrão (não é /ban estruturado), grava Dados normalmente (pode ser tabela ou string)
+	if type(dados) == "table" then
+		payload.Dados = HttpService:JSONEncode(dados)
+	else
+		payload.Dados = HttpService:JSONEncode({ Text = dados })
+	end
+	
+	-- Tenta fazer a requisição HTTP POST
+	local success, response = pcall(function()
+		return http_request({
+			Url = url,
+			Method = "POST",
+			Headers = {["Content-Type"] = "application/json"},
+			Body = HttpService:JSONEncode(payload)
+		})
+	end)
+	
+	-- FIM DO ENVIO: ATUALIZA O COOLDOWN E CACHE
+	if success then
+		UpdatePlayerLastMessage(messageID, currentTime)
+		lastSentTime = os.time()
+		if tipo == "Audio" or tipo == "Imagem" then lastSentMediaTypeTime = os.time() end
+	else
+		warn("Falha crítica ao enviar requisição HTTP. Cooldown não iniciado.")
+	end
+    
+    -- FECHAMENTO DO PAINEL APÓS O RETORNO DA REQUISIÇÃO
+    if onComplete then onComplete() end 
+
+	-- RESTAURA ESTADO DO UI
+	Enviar.Text = "Enviar"
+	TextBox.PlaceholderText = originalPlaceholder
+	TextBox.TextEditable = true -- DESBLOQUEIA O TEXTBOX
+	mensagemRespondidaId, mensagemRespondidaNome = "", ""
+	RespostaFrame.Visible = false
+	
+	task.delay(1, function() sendCooldown = false end)
+	return "Sucesso"
+end
+
+-- ==========================================================
+-- LÓGICA DO NOVO SISTEMA DE MÍDIA (CORRIGIDA + PREVIEW)
+-- ==========================================================
+
+-- Variável local para armazenar a conexão de filtro do TextBox
+local idTextBoxFilterConnection = nil
+local debounceTimer = nil 
+local DEBOUNCE_TIME = 0.3 -- 300 milissegundos é um tempo ideal de espera
+
+-- NOVO: Trava para evitar cliques múltiplos no Confirmar durante o envio
+local isSendingMedia = false
+
+-- Função auxiliar para criar a Prévia de ERRO (NOVO)
+local function CreateErrorPreview(container, mediaType)
+    -- Limpa o container
+    container:ClearAllChildren()
+    container.Size = UDim2.new(0, 200, 0, 150) -- Altura maior para imagem + texto
+    container.BackgroundTransparency = 0
+    container.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+    
+    -- Imagem de Erro (100x100)
+    local imgLabel = Instance.new("ImageLabel", container)
+    imgLabel.Size = UDim2.new(0, 100, 0, 100)
+    imgLabel.Position = UDim2.new(0.5, -50, 0, 5) -- Centrado horizontalmente, 5px do topo
+    imgLabel.Image = INVALID_ASSET_IMAGE_ID
+    imgLabel.BackgroundTransparency = 0
+    imgLabel.BackgroundColor3 = COR_SUPERFICIE
+    imgLabel.ScaleType = Enum.ScaleType.Fit
+    imgLabel.ZIndex = 4
+    
+    local UICorner_Image = Instance.new("UICorner", imgLabel)
+    UICorner_Image.CornerRadius = UDim.new(0, 5)
+
+    -- Texto de Erro
+    local errorLabel = Instance.new("TextLabel", container)
+    errorLabel.Size = UDim2.new(1, -20, 0, 30)
+    errorLabel.Position = UDim2.new(0, 0, 0, 0)
+    errorLabel.Text = string.format("[%s] ID Inválido ou Não Encontrado :(", mediaType)
+    errorLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    errorLabel.BackgroundTransparency = 1
+    errorLabel.TextXAlignment = Enum.TextXAlignment.Center
+    errorLabel.TextSize = 16
+    errorLabel.Font = Enum.Font.SourceSansBold
+    errorLabel.LayoutOrder = 2
+end
+
+-- ==========================================================
+-- NOVO SISTEMA DE VALIDAÇÃO DE ÁUDIO (ASSÍNCRONO E ESTÁVEL)
+-- ==========================================================
+
+local ContentProvider = game:GetService("ContentProvider")
+local lastInputAudioId = "" -- Para evitar race condition
+local tempValidationSound = nil
+
+-- Função auxiliar para criar o preview de erro (imagem + texto)
+local function CreateErrorPreview(container, mediaType)
+	container:ClearAllChildren()
+	container.Size = UDim2.new(0, 200, 0, 150)
+	container.BackgroundTransparency = 0
+	container.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+
+	local img = Instance.new("ImageLabel")
+	img.Image = INVALID_ASSET_IMAGE_ID
+	img.Size = UDim2.new(0, 100, 0, 100)
+	img.Position = UDim2.new(0.5, -50, 0, 5)
+	img.BackgroundTransparency = 1
+	img.ZIndex = 4
+	img.Parent = container
+
+	local txt = Instance.new("TextLabel")
+	txt.Text = string.format("[%s] ID inválido ou privado", mediaType)
+	txt.Size = UDim2.new(1, -10, 0, 30)
+	txt.Position = UDim2.new(0, 5, 1, -35)
+	txt.TextColor3 = Color3.fromRGB(255, 100, 100)
+	txt.BackgroundTransparency = 1
+	txt.TextXAlignment = Enum.TextXAlignment.Center
+	txt.Font = Enum.Font.SourceSansBold
+	txt.TextSize = 16
+	txt.ZIndex = 4
+	txt.Parent = container
+
+	isIdValidForSending = false
+	ConfirmarButton.Active = false
+	ConfirmarButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+end
+
+-- Função auxiliar: player simples de áudio
+local function CreateAudioPreview(container, audioId)
+	container:ClearAllChildren()
+	container.Size = UDim2.new(1, -10, 0, 50)
+	container.BackgroundTransparency = 0
+	container.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+
+	if previewSound then previewSound:Destroy() end
+	if previewUpdateConnection then previewUpdateConnection:Disconnect() end
+	previewSound = nil
+	isPreviewPlaying = false
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = "rbxassetid://" .. audioId
+	sound.Volume = 0.5
+	sound.Parent = workspace
+	previewSound = sound
+
+	local PlayButton = Instance.new("ImageButton")
+	PlayButton.Image = ICON_PLAY
+	PlayButton.Size = UDim2.new(0, 30, 0, 30)
+	PlayButton.Position = UDim2.new(0, 10, 0.5, -15)
+	PlayButton.BackgroundColor3 = COR_BOTAO_PRIMARIO
+	PlayButton.ZIndex = 4
+	PlayButton.Parent = container
+	local UICorner_Play = Instance.new("UICorner", PlayButton)
+	UICorner_Play.CornerRadius = UDim.new(0.5, 0)
+
+	local TimeLabel = Instance.new("TextLabel")
+	TimeLabel.Text = "Carregando duração..."
+	TimeLabel.Size = UDim2.new(1, -60, 0, 30)
+	TimeLabel.Position = UDim2.new(0, 50, 0.5, -15)
+	TimeLabel.TextColor3 = COR_TEXTO
+	TimeLabel.BackgroundTransparency = 1
+	TimeLabel.TextXAlignment = Enum.TextXAlignment.Left
+	TimeLabel.Font = Enum.Font.SourceSans
+	TimeLabel.TextSize = 15
+	TimeLabel.ZIndex = 4
+	TimeLabel.Parent = container
+
+	-- Espera o carregamento do áudio de forma assíncrona
+	task.spawn(function()
+		local startTime = tick()
+		local maxWait = 5
+		local loaded = false
+
+		-- Força o carregamento
+		pcall(function()
+			ContentProvider:PreloadAsync({sound})
+		end)
+
+		while not sound.IsLoaded and (tick() - startTime) < maxWait do
+			task.wait(0.1)
+		end
+
+		-- Verifica resultado
+		if sound.IsLoaded and sound.TimeLength > 0 then
+			loaded = true
+			isIdValidForSending = true
+			ConfirmarButton.Active = true
+			ConfirmarButton.BackgroundColor3 = COR_BOTAO_PRIMARIO
+			TimeLabel.Text = "🎵 Duração: " .. FormatTime(sound.TimeLength)
+		else
+			CreateErrorPreview(container, "Áudio")
+			sound:Destroy()
+			return
+		end
+
+		-- Se carregou com sucesso, ativa os botões
+		if loaded then
+			local duration = sound.TimeLength
+
+			local function TogglePlay()
+				if not sound.IsLoaded then return end
+				if sound.IsPlaying then
+					sound:Pause()
+					isPreviewPlaying = false
+					PlayButton.Image = ICON_PLAY
+					if previewUpdateConnection then previewUpdateConnection:Disconnect() previewUpdateConnection = nil end
+				else
+					sound:Play()
+					isPreviewPlaying = true
+					PlayButton.Image = ICON_PAUSE
+					if previewUpdateConnection then previewUpdateConnection:Disconnect() end
+					previewUpdateConnection = RunService.Heartbeat:Connect(function()
+						if sound.IsPlaying then
+							local remaining = math.max(0, duration - sound.TimePosition)
+							TimeLabel.Text = string.format("Tocando: -%s", FormatTime(remaining))
+						end
+					end)
+				end
+			end
+
+			PlayButton.MouseButton1Click:Connect(TogglePlay)
+
+			sound.Ended:Connect(function()
+				isPreviewPlaying = false
+				PlayButton.Image = ICON_PLAY
+				TimeLabel.Text = "🎵 Duração: " .. FormatTime(duration)
+				if previewUpdateConnection then previewUpdateConnection:Disconnect() previewUpdateConnection = nil end
+			end)
+		end
+	end)
+end
+
+-- ==========================================================
+-- FUNÇÃO UNIFICADA DE ATUALIZAÇÃO DE PRÉVIA (ÁUDIO E IMAGEM)
+-- ==========================================================
+
+local function UpdatePreview()
+	if previewSound and isPreviewPlaying then
+		previewSound:Stop()
+	end
+	if previewUpdateConnection then previewUpdateConnection:Disconnect() end
+	previewSound = nil
+	isPreviewPlaying = false
+
+	local text = IdTextBox.Text
+	local id = text:gsub("%D", "")
+
+	-- CORREÇÃO 1: Mova a verificação de cache para o topo.
+	-- Se o ID não mudou E a validação anterior foi TRUE, retorne IMEDIATAMENTE.
+	if id == lastCheckedMediaId and isIdValidForSending then
+		PreviewContainer.Visible = true 
+		return
+	end
+
+	-- Se chegou aqui, o ID é novo OU a validação anterior falhou.
+	lastCheckedMediaId = id
+	-- FIM CORREÇÃO 1
+
+	-- === CORREÇÃO: Trata ID Vazio (Esconde o painel) ===
+	if id == "" then
+        isIdValidForSending = false 
+        ConfirmarButton.Active = false
+        ConfirmarButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+		
+        -- Esconde a prévia em vez de mostrar a imagem de erro.
+		PreviewContainer.Visible = false
+		PreviewContainer:ClearAllChildren()
+		return
+	end
+    -- ======================================================
+
+	-- Se o ID não for vazio, mostra o container e limpa para carregar o novo conteúdo
+	PreviewContainer.Visible = true
+	PreviewContainer:ClearAllChildren()
+
+
+    if selectedMediaType == "Imagem" then
+        PreviewContainer:ClearAllChildren()
+        PreviewContainer.ClipsDescendants = true
+        PreviewContainer.BackgroundTransparency = 0
+        PreviewContainer.BackgroundColor3 = COR_FUNDO_PRINCIPAL
+        PreviewContainer.Size = UDim2.new(0, 220, 0, 220)
+        PreviewContainer.AnchorPoint = Vector2.new(0.5, 0.5)
+        PreviewContainer.Position = UDim2.new(0.5, 0, 0.5, 0)
+
+        -- Cria a área da imagem centralizada
+        local imageHolder = Instance.new("Frame")
+        imageHolder.Size = UDim2.new(1, -20, 1, -40)
+        imageHolder.Position = UDim2.new(0.5, 0, 0.5, -10)
+        imageHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+        imageHolder.BackgroundColor3 = COR_SUPERFICIE
+        imageHolder.Parent = PreviewContainer
+
+        local imageLabel = Instance.new("ImageLabel")
+        imageLabel.Size = UDim2.new(1, 0, 1, 0)
+        imageLabel.BackgroundTransparency = 1
+        imageLabel.ScaleType = Enum.ScaleType.Fit
+        imageLabel.Image = "rbxassetid://" .. id
+        imageLabel.ZIndex = 4
+        imageLabel.Parent = imageHolder
+
+        local UICorner_Img = Instance.new("UICorner")
+        UICorner_Img.CornerRadius = UDim.new(0, 10)
+        UICorner_Img.Parent = imageHolder
+
+        -- Texto de carregamento centralizado
+        local loadingLabel = Instance.new("TextLabel")
+        loadingLabel.Size = UDim2.new(1, 0, 0, 30)
+        loadingLabel.Position = UDim2.new(0.5, 0, 1, -10)
+        loadingLabel.AnchorPoint = Vector2.new(0.5, 1)
+        loadingLabel.Text = "Carregando imagem..."
+        loadingLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+        loadingLabel.BackgroundTransparency = 1
+        loadingLabel.Font = Enum.Font.SourceSans
+        loadingLabel.TextSize = 16
+        loadingLabel.ZIndex = 4
+        loadingLabel.Parent = PreviewContainer
+
+        -- Validação assíncrona (aguarda carregamento)
+        task.spawn(function()
+            local startTime = tick()
+            local timeout = 5
+            local valid = false
+
+            while not imageLabel.IsLoaded and (tick() - startTime) < timeout do
+                task.wait(0.1)
+            end
+            
+            -- CORREÇÃO 2: Evita que um resultado de validação antigo sobrescreva o novo.
+            if id ~= lastCheckedMediaId then return end 
+
+            if imageLabel.IsLoaded then
+                valid = true
+            end
+
+            loadingLabel:Destroy()
+
+            if valid then
+                -- Imagem carregou corretamente
+                isIdValidForSending = true
+                ConfirmarButton.Active = true
+                ConfirmarButton.BackgroundColor3 = COR_BOTAO_PRIMARIO
+            else
+                -- Imagem inválida, substitui por fallback
+                imageLabel.Image = INVALID_ASSET_IMAGE_ID
+                isIdValidForSending = false
+                ConfirmarButton.Active = false
+                ConfirmarButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+            end
+        end)
+
+    elseif selectedMediaType == "Audio" then
+        -- O reset síncrono agora só acontece porque a Verificação de Cache (CORREÇÃO 1)
+        -- já impediu que essa parte fosse alcançada se o ID já estivesse válido.
+        lastInputAudioId = id
+        isIdValidForSending = false
+        ConfirmarButton.Active = false
+        ConfirmarButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+
+        CreateAudioPreview(PreviewContainer, id)
+    end
+end
+
+-- Função para voltar à tela de seleção de mídia (Tela 2 -> Tela 1)
+local function BackToMediaSelect()
+    selectedMediaType = ""
+    isIdValidForSending = false -- Reseta o estado
+    
+    -- Transição Visual: Tela de Input -> Tela de Seleção
+    PanelTitle.Text = "Escolha para enviar"
+    PanelTitle.Visible = true
+    OptionsFrame.Visible = true
+    IdTextBox.Visible = false
+    ActionFrame.Visible = false
+    
+    -- NOVO: Limpa e esconde o container de pré-visualização
+    PreviewContainer:ClearAllChildren()
+    PreviewContainer.Visible = false
+    PreviewContainer.Size = UDim2.new(1, -10, 0, 0)
+
+    -- NOVO: Desconecta e limpa o áudio de preview
+    if previewSound then previewSound:Destroy() end
+    if previewUpdateConnection then previewUpdateConnection:Disconnect() end
+    previewSound = nil
+    isPreviewPlaying = false
+    idTextBoxFilterConnection = nil -- Garante que a conexão do TextChanged seja resetada
+
+    -- Reset de estado
+    IdTextBox.Text = ""
+    IdTextBox.PlaceholderText = "Selecione Imagem ou Áudio acima..."
+    IdTextBox.TextEditable = false
+    ConfirmarButton.Active = false
+    ConfirmarButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+    ConfirmarButton.Text = "Confirmar" 
+end
+
+-- NOVO: Função para fechar o painel de mídia completamente
+local function CloseMediaPanel()
+    isMediaPanelOpen = false
+    -- Move o painel para fora da tela e o esconde
+    TweenService:Create(MediaPanel, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Position = UDim2.new(0.5, 0, 1.5, 0), -- Move para baixo
+        BackgroundTransparency = 1,
+        Transparency = 1
+    }):Play()
+
+    task.delay(0.3, function()
+        MediaPanel.Visible = false
+        BackToMediaSelect() -- Reseta a visualização interna (incluindo a prévia)
+    end)
+end
+
+-- NOVO: Função para abrir o painel e selecionar a mídia
+local function TransitionToMediaInput(mediaType)
+    selectedMediaType = mediaType
+    PanelTitle.Text = "Enviar "..mediaType
+    
+    -- Transição Visual: Tela de Seleção -> Tela de Input
+    OptionsFrame.Visible = false
+    IdTextBox.Visible = true
+    IdTextBox.TextEditable = true
+    IdTextBox.PlaceholderText = "Insira o ID de "..mediaType.." (apenas números)"
+    ActionFrame.Visible = true
+    
+-- NOVO: Conecta a função de pré-visualização ao campo de texto usando Debounce
+
+if idTextBoxFilterConnection then
+    idTextBoxFilterConnection:Disconnect()
+    idTextBoxFilterConnection = nil
+end
+
+idTextBoxFilterConnection = IdTextBox:GetPropertyChangedSignal("Text"):Connect(function()
+    -- 1. Filtro (Mantém o filtro para garantir apenas números)
+    IdTextBox.Text = IdTextBox.Text:gsub("[^0-9]", "")
+    
+    -- 2. Debounce: Cancela o timer anterior (se o usuário ainda estiver digitando)
+    if debounceTimer then
+        task.cancel(debounceTimer)
+    end
+    
+    -- 3. Debounce: Agenda a chamada de UpdatePreview
+    -- A função só ser�� chamada se o usuário parar de digitar por 0.3 segundos.
+    debounceTimer = task.delay(DEBOUNCE_TIME, UpdatePreview)
+end)
+
+    -- Força a primeira atualização (caso o texto já tenha algo)
+    UpdatePreview() 
+
+end
+
+-- FUNÇÃO PRINCIPAL DE CONFIRMAÇÃO E CORREÇÃO DO BUG
+local function HandleMediaConfirmation()
+    if isSendingMedia or not isIdValidForSending then -- BLOQUEIO SE JÁ ESTIVER ENVIANDO OU SE O ID FOR INVÁLIDO
+        -- Adiciona feedback visual se tentar enviar inválido
+        if not isIdValidForSending then
+            IdTextBox.PlaceholderText = "ID inválido. Não é possível confirmar."
+            task.delay(2, function()
+                 IdTextBox.PlaceholderText = "Insira o ID de "..selectedMediaType.." (apenas números)"
+            end)
+        end
+        return
+    end
+    
+    -- Para o áudio de preview antes de enviar
+    if previewSound and isPreviewPlaying then
+        previewSound:Stop()
+        isPreviewPlaying = false
+    end
+
+    local id = IdTextBox.Text:gsub("%D", "") -- Filtra e mantém apenas dígitos (IDs são numéricos)
+    
+    isSendingMedia = true
+    PanelTitle.Text = "Enviando..."
+    IdTextBox.Visible = false
+    PreviewContainer.Visible = false
+    ActionFrame.Visible = false
+    
+    local dados = {}
+    if selectedMediaType == "Audio" then
+        dados.AudioId = id 
+    elseif selectedMediaType == "Imagem" then
+        dados.ImageId = id 
+    else
+        warn("Erro de tipo de mídia desconhecido:", selectedMediaType)
+        isSendingMedia = false
+        ConfirmarButton.Text = "Confirmar"
+        return
+    end
+    
+    -- Envia a mensagem com o tipo de mídia e os dados específicos
+    local result = SendMessagePayload(selectedMediaType, dados)
+    
+    if result == "Sucesso" then
+        CloseMediaPanel() -- Fecha o painel após o envio
+    end
+    
+    isSendingMedia = false
+    ConfirmarButton.Text = "Confirmar"
+end
+
+
+-- ==========================================================
+-- CONEXÕES DE INPUT
+-- ==========================================================
+
+-- Conexão do botão principal de Mídia (Abre/Fecha o painel)
+MediaButton.MouseButton1Click:Connect(function()
+    if not isLoadingCompleted then return end
+
+    if not isMediaPanelOpen then
+        isMediaPanelOpen = true
+        MediaPanel.Visible = true
+        -- Anima o painel para o centro
+        TweenService:Create(MediaPanel, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+            Position = UDim2.new(0.5, 0, 0.5, 0),
+            BackgroundTransparency = 0,
+            Transparency = 0
+        }):Play()
+    else
+        CloseMediaPanel()
+    end
+end)
+
+-- Conexões dos botões de seleção (Tela 1)
+AudioButton.MouseButton1Click:Connect(function()
+    if not isLoadingCompleted then return end
+    TransitionToMediaInput("Audio") 
+end)
+
+ImageButton.MouseButton1Click:Connect(function()
+    if not isLoadingCompleted then return end
+    TransitionToMediaInput("Imagem")
+end)
+
+-- Conexões dos botões de Ação (Tela 2)
+ConfirmarButton.MouseButton1Click:Connect(HandleMediaConfirmation)
+
+CancelarButton.MouseButton1Click:Connect(function()
+    if not isLoadingCompleted then return end
+    BackToMediaSelect() -- Volta para a tela de seleção e reseta o preview
+end)
+
+-- ==========================================================
+-- FUNÇÃO PRINCIPAL DE ENVIO DE MENSAGEM (com interceptação local)
+-- ==========================================================
+local function EnviarMensagem(txt)
+	local textoLimpo = txt:gsub("^%s+", "")
+	if textoLimpo == "" then return end
+
+	-- Tratamento de comandos locais antes do envio
+	if textoLimpo:sub(1,1) == "/" then
+		local partes = {}
+		for part in textoLimpo:gmatch("[^%s]+") do table.insert(partes, part) end
+		local comando = partes[1]:lower()
+
+-- === COMANDO LOCAL: /ban (CORRIGIDO: BLOQUEIO SELETIVO DO CLIQUE) ===
+if comando == "/ban" then
+    if #partes < 2 then
+        TextBox.PlaceholderText = "Uso: /ban <NomeDoPlayer>"
+        task.delay(3, function()
+            TextBox.PlaceholderText = "Digite sua mensagem..."
+        end)
+        return
+    end
+
+    local targetPlayerName = partes[2]
+    
+    local isPermanentBan = false 
+
+    -- ==========================================================
+    -- FUNÇÃO AUXILIAR PARA BLOQUEAR/DESBLOQUEAR CAMPOS DE DURAÇÃO 
+    -- AGORA FAZ O BLOQUEIO COMPLETO DE INTERAÇÃO (Hitbox + TextEditable)
+    -- ==========================================================
+    local function AtualizarEstadoDuracao(painelFrame, deveBloquearTempo)
+        
+        local allSubtitles = {}
+        local allTextBoxes = {}
+        
+        -- Mapeamento dos elementos (lógica mantida)
+        for _, childFrame in ipairs(painelFrame:GetChildren()) do
+            if childFrame:IsA("Frame") and childFrame.LayoutOrder > 0 then
+                for _, item in ipairs(childFrame:GetDescendants()) do
+                    if item:IsA("TextLabel") and item.TextXAlignment == Enum.TextXAlignment.Left then
+                        if item.Text == "Days" or item.Text == "Hours" or item.Text == "Minutes" or item.Text == "Motivo" then
+                            table.insert(allSubtitles, item)
+                        end
+                    elseif item:IsA("TextBox") then
+                        table.insert(allTextBoxes, item)
+                    end
+                end
+            end
+        end
+
+        if #allSubtitles < 4 or #allTextBoxes < 4 then
+            warn("Erro ao mapear elementos de duração. A estrutura do painel pode ter mudado.")
+            return
+        end
+        
+        local subtitlesTempo = {allSubtitles[1], allSubtitles[2], allSubtitles[3]} 
+        local boxesTempo = {allTextBoxes[1], allTextBoxes[2], allTextBoxes[3]}   
+        local motivoSubtitulo = allSubtitles[4]
+        local boxMotivo = allTextBoxes[4] 
+
+        local COR_BLOQUEADA = Color3.fromRGB(100, 100, 100) 
+        local corOriginalSubtitulo = Color3.fromRGB(220, 220, 220) 
+        local corOriginalTextBox = Color3.fromRGB(255, 255, 255) 
+        
+        local corMotivoObrigatorio = Color3.fromRGB(255, 100, 100)
+        local placeholderMotivoObrigatorio = "Motivo Obrigatório"
+
+        -- 1. BLOQUEIO/DESBLOQUEIO DOS CAMPOS DE TEMPO (O clique volta a ser bloqueado aqui)
+        for _, sub in ipairs(subtitlesTempo) do
+            sub.TextColor3 = deveBloquearTempo and COR_BLOQUEADA or corOriginalSubtitulo
+        end
+        
+        for i, box in ipairs(boxesTempo) do
+            
+            -- CHAVE DA CORREÇÃO: Encontra o Hitbox e ativa-o para bloquear o clique/toque
+            local Hitbox = box.Parent:FindFirstChild("Hitbox")
+            if Hitbox and Hitbox:IsA("TextButton") then
+                Hitbox.Active = deveBloquearTempo -- Ativa/Desativa o bloqueador de clique (ZIndex 20)
+            end
+            
+            -- Bloqueio de input de texto e seleção (segurança extra)
+            box.TextEditable = not deveBloquearTempo 
+            box.Selectable = not deveBloquearTempo
+            
+            -- Controle Visual
+            box.TextColor3 = deveBloquearTempo and COR_BLOQUEADA or corOriginalTextBox
+            box.PlaceholderColor3 = deveBloquearTempo and COR_BLOQUEADA or corOriginalTextBox
+            
+            if deveBloquearTempo then
+                box.Text = "" 
+            end
+        end
+        
+        -- 2. MOTIVO (Torna Obrigatório quando Permanente e muda cor - SEM BLOQUEAR INTERAÇÃO)
+        if deveBloquearTempo then
+            boxMotivo.PlaceholderText = placeholderMotivoObrigatorio
+            boxMotivo.PlaceholderColor3 = corMotivoObrigatorio
+            motivoSubtitulo.TextColor3 = corMotivoObrigatorio 
+        else
+            boxMotivo.PlaceholderText = "Opcional"
+            boxMotivo.PlaceholderColor3 = corOriginalTextBox
+            motivoSubtitulo.TextColor3 = corOriginalSubtitulo
+        end
+        
+        -- NOVO: Garante que o Hitbox do Motivo esteja sempre inativo (clicável/editável)
+        local HitboxMotivo = boxMotivo.Parent:FindFirstChild("Hitbox")
+        if HitboxMotivo and HitboxMotivo:IsA("TextButton") then
+            HitboxMotivo.Active = false
+        end
+        boxMotivo.TextEditable = true
+        boxMotivo.Selectable = true
+    end
+    -- ==========================================================
+
+local BanPanelData = CriarMiniPainel("🚫 Ban Player", {
+    { {Tipo = "Texto", Texto = targetPlayerName} },
+    
+    -- DURAÇÃO
+    { {Tipo = "Subtitulo", Texto = "Days"} },
+    { {Tipo = "TextBox", Texto = "Ex: 0"} },
+    { {Tipo = "Subtitulo", Texto = "Hours"} },
+    { {Tipo = "TextBox", Texto = "Ex: 0"} },
+    { {Tipo = "Subtitulo", Texto = "Minutes"} },
+    { {Tipo = "TextBox", Texto = "Ex: 1"} },
+    
+    -- SWITCH PARA BAN PERMANENTE
+    { 
+        {
+            Tipo = "Switch", 
+            Texto = "Ban Permanente?", 
+            EstadoInicial = false, 
+            Funcao = function(novoEstado, utils)
+                isPermanentBan = novoEstado 
+                AtualizarEstadoDuracao(utils.painel, novoEstado)
+                print("Ban Permanente? alterado para:", novoEstado)
+            end
+        } 
+    },
+    
+    -- MOTIVO
+    { {Tipo = "Subtitulo", Texto = "Motivo"} },
+    { {Tipo = "TextBox", Texto = "Opcional"} },
+    
+    -- BOTÕES
+    {
+        {Tipo = "Botao", Texto = "Cancelar", Funcao = function(utils)
+            utils.Fechar()
+        end},
+        {Tipo = "Botao", Texto = "Confirmar", Funcao = function(utils) 
+            local painelFrame = utils.painel 
+
+            -- Coleta TextBoxes
+            local inputs = {}
+            for _, obj in ipairs(painelFrame:GetDescendants()) do
+                if obj:IsA("TextBox") then
+                    table.insert(inputs, obj)
+                end
+            end
+
+            if #inputs < 4 then 
+                warn("Erro de validação: Faltando TextBoxes.") 
+                return 
+            end
+
+            local boxDays, boxHours, boxMinutes, boxMotivo = inputs[1], inputs[2], inputs[3], inputs[4]
+
+            -- 🔹 Validação dos campos de tempo (quando NÃO for ban permanente)
+            if not isPermanentBan then
+                local days = tonumber(boxDays.Text) or 0
+                local hours = tonumber(boxHours.Text) or 0
+                local minutes = tonumber(boxMinutes.Text) or 0
+
+                if days == 0 and hours == 0 and minutes == 0 then
+                    for _, box in ipairs({boxDays, boxHours, boxMinutes}) do
+                        local oldColor = box.PlaceholderColor3
+                        box.PlaceholderColor3 = Color3.fromRGB(255, 0, 0)
+                        task.delay(1.5, function()
+                            box.PlaceholderColor3 = oldColor
+                        end)
+                    end
+                    return
+                end
+            end
+
+            -- 🔹 Validação do motivo (obrigatório se for permanente)
+            local motivoTexto = (boxMotivo.Text ~= "" and boxMotivo.Text ~= "Opcional") and boxMotivo.Text or ""
+            if isPermanentBan and motivoTexto == "" then
+                local originalText = boxMotivo.PlaceholderText
+                local originalColor = boxMotivo.PlaceholderColor3
+                boxMotivo.PlaceholderText = "MOTIVO É OBRIGATÓRIO!"
+                boxMotivo.PlaceholderColor3 = Color3.fromRGB(255, 0, 0)
+                task.delay(2, function()
+                    boxMotivo.PlaceholderText = originalText 
+                    boxMotivo.PlaceholderColor3 = originalColor 
+                end)
+                return
+            end
+
+            -- Cálculo da duração
+            local days = tonumber(inputs[1].Text) or 0
+            local hours = tonumber(inputs[2].Text) or 0
+            local minutes = tonumber(inputs[3].Text) or 0
+
+            local totalMin = 0
+            if isPermanentBan then
+                totalMin = 999999 
+            else
+                totalMin = (days * 24 * 60) + (hours * 60) + minutes
+                if totalMin == 0 then totalMin = 1 end 
+            end
+
+            local motivo = motivoTexto ~= "" and motivoTexto or "Sem motivo"
+            print(string.format("🔧 Ban local: %s por %d minutos. Motivo: %s", targetPlayerName, totalMin, motivo))
+
+            utils.Bloquear(true)
+            utils.Limpar("⌛Enviando...") 
+
+            local banPayload = {
+                Command = "ban",
+                TargetName = targetPlayerName,
+                TargetUserId = nil,
+                ModeratorUserId = LocalPlayer.UserId,
+                ModeratorName = LocalPlayer.Name,
+                Motivo = motivo,
+                DurationMinutes = totalMin,
+                Timestamp = os.time()
+            }
+
+            -- tenta resolver id
+            pcall(function()
+                local ok, id = pcall(function() return Players:GetUserIdFromNameAsync(targetPlayerName) end)
+                if ok and tonumber(id) then banPayload.TargetUserId = tonumber(id) end
+            end)
+
+            SendMessagePayload("Padrao", banPayload, utils.Fechar)
+        end}
+    }
+})
+
+-- ===========================================
+-- NOVO SISTEMA: BLOQUEAR "Confirmar" ATÉ PREENCHER TEMPO OU MOTIVO
+-- ===========================================
+do
+    local painel = BanPanelData.painel
+
+    -- Pega o botão Confirmar
+    local confirmarBtn
+    for _, v in ipairs(painel:GetDescendants()) do
+        if v:IsA("TextButton") and v.Text == "Confirmar" then
+            confirmarBtn = v
+            break
+        end
+    end
+
+    -- Pega TextBoxes
+    local boxes = {}
+    for _, v in ipairs(painel:GetDescendants()) do
+        if v:IsA("TextBox") then
+            table.insert(boxes, v)
+        end
+    end
+    local boxDays, boxHours, boxMinutes, boxMotivo = boxes[1], boxes[2], boxes[3], boxes[4]
+
+    -- Pega o checkbox do switch
+    local switchCheckBox
+    for _, v in ipairs(painel:GetDescendants()) do
+        if v:IsA("TextLabel") and (v.Text:find("%[") and v.Text:find("%]")) then
+            switchCheckBox = v
+            break
+        end
+    end
+
+    local function AtualizarEstadoConfirmar()
+        if not confirmarBtn then return end
+
+        -- Caso o ban seja permanente: exige MOTIVO preenchido
+        if isPermanentBan then
+            local motivo = (boxMotivo.Text or ""):gsub("%s+", "")
+            local valido = motivo ~= "" and motivo:lower() ~= "opcional"
+
+            if valido then
+                confirmarBtn.Active = true
+                confirmarBtn.BackgroundColor3 = COR_BOTAO_PRIMARIO
+            else
+                confirmarBtn.Active = false
+                confirmarBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+            end
+            return
+        end
+
+        -- Caso NÃO seja permanente: exige algum tempo > 0
+        local d = tonumber(boxDays.Text) or 0
+        local h = tonumber(boxHours.Text) or 0
+        local m = tonumber(boxMinutes.Text) or 0
+        local temTempo = (d > 0) or (h > 0) or (m > 0)
+
+        if temTempo then
+            confirmarBtn.Active = true
+            confirmarBtn.BackgroundColor3 = COR_BOTAO_PRIMARIO
+        else
+            confirmarBtn.Active = false
+            confirmarBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+        end
+    end
+
+    -- Atualiza em tempo real
+    if boxDays then boxDays:GetPropertyChangedSignal("Text"):Connect(AtualizarEstadoConfirmar) end
+    if boxHours then boxHours:GetPropertyChangedSignal("Text"):Connect(AtualizarEstadoConfirmar) end
+    if boxMinutes then boxMinutes:GetPropertyChangedSignal("Text"):Connect(AtualizarEstadoConfirmar) end
+    if boxMotivo then boxMotivo:GetPropertyChangedSignal("Text"):Connect(AtualizarEstadoConfirmar) end
+
+    -- Corrige o visual após alternar o switch
+    if switchCheckBox then
+        switchCheckBox:GetPropertyChangedSignal("Text"):Connect(function()
+            AtualizarEstadoConfirmar()
+            task.delay(0.05, AtualizarEstadoConfirmar)
+        end)
+    end
+
+    -- Inicializa bloqueado corretamente
+    task.defer(AtualizarEstadoConfirmar)
+end
+
+    TextBox.Text = "" 
+    return 
+end
+
+		-- Outros comandos continuam como antes
+		return SendMessagePayload("Padrao", textoLimpo)
+	else
+		return SendMessagePayload("Padrao", textoLimpo)
+	end
+end
+
+Enviar.MouseButton1Click:Connect(function() EnviarMensagem(TextBox.Text) end)
+TextBox.FocusLost:Connect(function(enterPressed)
+	if enterPressed then EnviarMensagem(TextBox.Text) end
+end)
+
+-- [[ SISTEMA DE COMANDOS (Mantido) ]]
+comandos["/clear"] = function(msg, args)
+	if msg.Player:lower() == LocalPlayer.Name:lower() then	
+		for _, child in ipairs(ScrollingFrame:GetChildren()) do
+			if child:IsA("Frame") or child:IsA("TextLabel") then
+				if child.Name ~= "sep_"..FormatarData(msg.Timestamp) then
+					child:Destroy()
+					LoadOld:Destroy()	
+				end
+			end
+		end
+		task.wait()
+		ScrollingFrame.CanvasSize = UDim2.new(0,0,0,UIListLayout.AbsoluteContentSize.Y)
+	end
+end
+
+local function ProcessarComando(msg)
+	if comandosExecutados[msg.ID] then return end	
+
+	local timestampMsg = tonumber(msg.Timestamp) or 0
+	local diff = os.time() - timestampMsg
+	if diff > 30 then return end
+
+	local texto = msg.Mensagem:gsub("^%s+", "")	
+	if texto:sub(1,1) == "/" then
+		local partes = {}
+		for part in texto:gmatch("[^%s]+") do table.insert(partes, part) end
+		
+		local comandoNome = partes[1]:lower()
+		local args = {}
+		for i = 2, #partes do table.insert(args, partes[i]) end
+
+		if comandos[comandoNome] then
+			local requiredClass = NIVEIS_COMANDO[comandoNome] or "DEFAULT"
+			
+			if msg.Player:lower() == LocalPlayer.Name:lower() and not IsPermissionSufficient(requiredClass) then
+				warn(string.format("NEGADO: Comando %s ignorado no log. Permissão insuficiente.", comandoNome))	
+				return	
+			end
+			
+			comandosExecutados[msg.ID] = true
+			comandos[comandoNome](msg, args)	
+		end
+	end
+end
+
+-- [[ CRIAÇÃO DE MENSAGENS E ATUALIZAÇÃO (Modificado para Estilo) ]]
+
+local function CriarMensagem(msg, mapaMensagens)
+	if mensagensCriadas[msg.ID] then
+		return
+	end
+	
+	mensagensCriadas[msg.ID] = true -- Marca a mensagem como criada
+
+	local timestamp = tonumber(msg.Timestamp) or 0
+	local dataStr = FormatarData(timestamp)
+	local dataInicioTimestamp = GetInicioDoDia(timestamp)
+
+	-- Lógica de Separador de Data
+	local sepName = "sep_"..dataStr
+	local separador = ScrollingFrame:FindFirstChild(sepName)
+	if not separador then
+		separador = Instance.new("TextLabel", ScrollingFrame)
+		separador.Name = sepName
+		separador.Size = UDim2.new(1,0,0,20)
+		separador.BackgroundTransparency = 1
+		separador.Text = "─────────────── "..dataStr.." ───────────────"
+		separador.TextColor3 = Color3.fromRGB(120,120,120)
+		separador.TextSize = 14
+		separador.Font = Enum.Font.SourceSansItalic
+		separador.LayoutOrder = dataInicioTimestamp - 1
+	end
+
+	local frameMsg = Instance.new("Frame", ScrollingFrame)
+	frameMsg.Name = msg.ID
+	frameMsg.AutomaticSize = Enum.AutomaticSize.Y
+	frameMsg.BackgroundColor3 = COR_SUPERFICIE
+	frameMsg.BackgroundTransparency = 1 
+	frameMsg.LayoutOrder = timestamp	
+	frameMsg.Size = UDim2.new(1,0,0,0)
+
+	-- Frame interno para padding/cores (Bolha de Chat)
+	local contentWrapper = Instance.new("Frame", frameMsg)
+	contentWrapper.Size = UDim2.new(1, -10, 0, 0)
+	contentWrapper.Position = UDim2.new(0, 5, 0, 0)
+	contentWrapper.BackgroundColor3 = COR_MENSAGEM
+	contentWrapper.BackgroundTransparency = 0.1
+	contentWrapper.AutomaticSize = Enum.AutomaticSize.Y
+	
+	local UICorner_Msg = Instance.new("UICorner", contentWrapper)
+	UICorner_Msg.CornerRadius = UDim.new(0, RAIO_CANTO_PEQUENO)
+
+	local avatar = Instance.new("ImageLabel", contentWrapper)
+	avatar.Size = UDim2.new(0,36,0,36)
+	avatar.Position = UDim2.new(0,5,0,5)
+	avatar.BackgroundTransparency = 1
+	avatar.Image = GetPlayerThumbnail(msg.UserId)
+	
+	local UICorner_Avatar = Instance.new("UICorner", avatar)
+	UICorner_Avatar.CornerRadius = UDim.new(0.5, 0) -- Avatar Circular
+
+	local x = 46
+	local y = 5
+
+-- PEGAR CLASSE DO PLAYER
+local info = playerInfo[tonumber(msg.UserId)]
+local Class = info and info.Class or "DEFAULT"
+
+-- CRIAR NOME
+local nome = Instance.new("TextLabel", contentWrapper)
+nome.Size = UDim2.new(1,-x-10,0,18)
+nome.Position = UDim2.new(0,x,0,y)
+nome.Text = msg.Player
+nome.BackgroundTransparency = 1
+nome.TextXAlignment = Enum.TextXAlignment.Left
+nome.TextSize = 16
+nome.Font = Enum.Font.SourceSansBold
+
+-- Aguardar TextBounds para posicionar o ícone corretamente
+nome:GetPropertyChangedSignal("TextBounds"):Wait()
+
+-- COR E EFEITOS DO NOME
+if Class == "DEFAULT" then
+	nome.TextColor3 = Color3.fromRGB(0,150,255)
+
+elseif Class == "VIP" then
+	nome.TextColor3 = Color3.fromRGB(255,190,0)
+
+	local grad = Instance.new("UIGradient", nome)
+	grad.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(200,140,0)),
+		ColorSequenceKeypoint.new(0.4, Color3.fromRGB(255,255,200)),
+		ColorSequenceKeypoint.new(0.6, Color3.fromRGB(255,255,200)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(200,140,0))
+	})
+	grad.Offset = Vector2.new(-1, 0)
+
+	task.spawn(function()
+		local speed = 0.05
+		while nome and nome.Parent do
+			grad.Offset = grad.Offset + Vector2.new(speed, 0)
+			if grad.Offset.X >= 1 then
+				grad.Offset = Vector2.new(-1, 0)
+			end
+			task.wait(0.03)
+		end
+	end)
+
+elseif Class == "ADM" then
+	nome.TextColor3 = Color3.fromRGB(200, 150, 255)
+
+	local grad = Instance.new("UIGradient", nome)
+	grad.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(100, 0, 200)),
+		ColorSequenceKeypoint.new(0.3, Color3.fromRGB(200, 50, 255)),
+		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(100, 220, 255)),
+		ColorSequenceKeypoint.new(0.7, Color3.fromRGB(200, 50, 255)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(100, 0, 200))
+	})
+
+	task.spawn(function()
+		local pulse = 0
+		local up = true
+		while nome and nome.Parent do
+			if up then pulse = pulse + 0.01 else pulse = pulse - 0.01 end
+			if pulse >= 1 then up = false elseif pulse <= 0 then up = true end
+			nome.TextColor3 = Color3.fromRGB(
+				200 + 55*pulse,
+				150 + 105*pulse,
+				255
+			)
+			task.wait(0.02)
+		end
+	end)
+
+elseif Class == "DEV" then
+
+	task.spawn(function()
+		while nome and nome.Parent do
+			local t = tick() * 2
+			local r = math.sin(t) * 127 + 128
+			local g = math.sin(t + 2) * 127 + 128
+			local b = math.sin(t + 4) * 127 + 128
+			local rgb = Color3.fromRGB(r, g, b)
+			nome.TextColor3 = rgb
+			task.wait(0.05)
+		end
+	end)
+end
+
+-- ==== SUBSTITUA AQUI: criação do classIcon e UpdateClassIconPosition ====
+local classIcon = Instance.new("ImageLabel", contentWrapper)
+classIcon.Name = "ClassIcon"
+classIcon.BackgroundTransparency = 1
+classIcon.Size = UDim2.new(0,18,0,18)
+classIcon.Image = ""
+classIcon.AnchorPoint = Vector2.new(0, 0) -- vamos posicionar por offset interno
+
+-- ajuste fino vertical (troque -2 por -3 / -4 / -1 conforme precisar)
+local verticalAdjust = 0.3
+
+local function UpdateClassIconPosition()
+    -- proteção básica
+    if not nome or not nome.Parent or not contentWrapper or not contentWrapper.Parent then return end
+
+    -- pega as posições absolutas
+    local nomeAbsPos = nome.AbsolutePosition
+    local wrapperAbsPos = contentWrapper.AbsolutePosition
+
+    -- pega larguras / alturas
+    local textWidth = 0
+    pcall(function() textWidth = nome.TextBounds.X end)
+
+    local nomeAbsSizeY = nome.AbsoluteSize.Y or 18
+    local iconHeight = classIcon.Size.Y.Offset or 18
+
+    -- calcula offset dentro do contentWrapper
+    local offsetX = (nomeAbsPos.X - wrapperAbsPos.X) + textWidth + 6   -- 6px de espaçamento
+    local offsetY = (nomeAbsPos.Y - wrapperAbsPos.Y) + math.floor((nomeAbsSizeY - iconHeight)/2) + verticalAdjust
+
+    -- aplica (usa math.floor para evitar subpixel)
+    classIcon.Position = UDim2.new(0, math.floor(offsetX), 0, math.floor(offsetY))
+end
+
+-- Conexões: atualiza quando texto, tamanho ou wrapper mudarem
+nome:GetPropertyChangedSignal("TextBounds"):Connect(UpdateClassIconPosition)
+nome:GetPropertyChangedSignal("AbsoluteSize"):Connect(UpdateClassIconPosition)
+contentWrapper:GetPropertyChangedSignal("AbsoluteSize"):Connect(UpdateClassIconPosition)
+
+-- também atualiza no Heartbeat uma vez logo após criar (garante posicionamento inicial)
+local started = false
+task.spawn(function()
+    -- aguarda um pouco para que AbsolutePosition/Size fiquem válidos
+    for i=1,30 do
+        if nome.TextBounds and nome.TextBounds.X > 0 and nome.AbsoluteSize and nome.AbsoluteSize.Y > 0 then break end
+        task.wait(0.02)
+    end
+    UpdateClassIconPosition()
+    -- opcional: roda correção rápida por 0.2s caso algo mude logo após
+    if not started then
+        started = true
+        local t0 = tick()
+        while tick() - t0 < 0.2 do
+            UpdateClassIconPosition()
+            task.wait(0.03)
+        end
+    end
+end)
+-- =======================================================================
+
+-- DEFINIÇÃO DA IMAGEM POR CLASSE (mantive suas imagens)
+if Class == "VIP" then
+    classIcon.Image = "rbxassetid://13066690016"
+    classIcon.Size = UDim2.new(0,22,0,22) -- ícone VIP um pouco maior
+elseif Class == "ADM" then
+    classIcon.Image = "rbxassetid://17599296016"
+elseif Class == "DEV" then
+    classIcon.Image = "rbxassetid://9415533863"
+    -- Efeito RGB no ícone (mantive sua lógica)
+    local grad = Instance.new("UIGradient", classIcon)
+    grad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255,0,0)),
+        ColorSequenceKeypoint.new(0.33, Color3.fromRGB(0,255,0)),
+        ColorSequenceKeypoint.new(0.66, Color3.fromRGB(0,0,255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(255,0,0))
+    })
+    task.spawn(function()
+        while classIcon and classIcon.Parent do
+            for i = 0, 360, 4 do
+                grad.Rotation = i
+                task.wait(0.03)
+            end
+        end
+    end)
+end
+
+	y += 18
+
+	local jogo = Instance.new("TextLabel", contentWrapper)
+	jogo.Size = UDim2.new(1,-x-10,0,16)
+	jogo.Position = UDim2.new(0,x,0,y)
+	jogo.Text = "📍 "..GetExperienceNameById(msg.PlaceId)
+	jogo.TextColor3 = Color3.fromRGB(150,150,200)
+	jogo.BackgroundTransparency = 1
+	jogo.TextXAlignment = Enum.TextXAlignment.Left
+	jogo.TextSize = 14
+	jogo.Font = Enum.Font.SourceSansItalic
+
+	y += 18
+
+	-- Resposta (Citação)
+	if msg.RespostaDe ~= "" and mapaMensagens[msg.RespostaDe] then
+		local msgOriginal = mapaMensagens[msg.RespostaDe]
+		local nomeResp = msgOriginal.Player	
+		local textoResp = msgOriginal.Mensagem
+		
+		local bloco = Instance.new("Frame", contentWrapper)
+		bloco.Size = UDim2.new(1,-x-10,0,30)	
+		bloco.Position = UDim2.new(0,x,0,y)
+		bloco.BackgroundColor3 = COR_RESPOSTA
+		bloco.BackgroundTransparency = 0.5
+		bloco.AutomaticSize = Enum.AutomaticSize.Y
+		
+		local UICorner_Bloco = Instance.new("UICorner", bloco)
+		UICorner_Bloco.CornerRadius = UDim.new(0, 4)
+
+		local labelNome = Instance.new("TextLabel", bloco)
+		labelNome.Size = UDim2.new(1,-10,0,15)
+		labelNome.Position = UDim2.new(0,5,0,0)
+		labelNome.Text = nomeResp
+		labelNome.TextColor3 = Color3.fromRGB(150,150,255)
+		labelNome.BackgroundTransparency = 1
+		labelNome.TextXAlignment = Enum.TextXAlignment.Left
+		labelNome.TextSize = 14
+
+		local labelMsg = Instance.new("TextLabel", bloco)
+		labelMsg.Size = UDim2.new(1,-10,0,15)
+		labelMsg.Position = UDim2.new(0,5,0,15)
+		labelMsg.Text = textoResp	
+		labelMsg.TextColor3 = Color3.fromRGB(200,200,200)
+		labelMsg.BackgroundTransparency = 1
+		labelMsg.TextXAlignment = Enum.TextXAlignment.Left
+		labelMsg.TextSize = 14
+		labelMsg.TextWrapped = true
+		
+		task.wait()
+		y += bloco.AbsoluteSize.Y + 2
+	end
+	
+	-- TRATAMENTO DE TIPO DE MENSAGEM (Audio/Imagem/Padrao)
+
+	local tipo = msg.Tipo or "Padrao"
+	local dados = {}
+	if msg.Dados then
+		local success, decoded = pcall(HttpService.JSONDecode, HttpService, msg.Dados)
+		if success and type(decoded) == "table" then dados = decoded end
+	end
+	
+	local contentHeight = 0
+	local mediaContentFrame = Instance.new("Frame", contentWrapper)
+	mediaContentFrame.Size = UDim2.new(1,-x-10,0,1)
+	mediaContentFrame.Position = UDim2.new(0,x,0,y)
+	mediaContentFrame.BackgroundTransparency = 1
+	mediaContentFrame.AutomaticSize = Enum.AutomaticSize.Y
+	
+-- // DEFINIÇÕES DE ESTILO DO BOTÃO RESPONDER (AJUSTADO PARA O CANTO ESQUERDO)
+local RESPONDER_BUTTON_WIDTH = 60
+local RESPONDER_BUTTON_HEIGHT = 16
+local BUTTON_PADDING_BOTTOM = 5
+local BUTTON_PADDING_RIGHT = 5 -- Usado como padding ESQUERDO agora
+-- ESTE CÁLCULO É REMOVIDO OU AJUSTADO. PARA O CANTO ESQUERDO, O OFFSET X É O PRÓPRIO PADDING
+local BUTTON_X_OFFSET = BUTTON_PADDING_RIGHT 
+
+-- // FUNÇÃO REUTILIZÁVEL PARA LÓGICA DE CLIQUE
+-- Isso evita repetição de código no clique.
+local function ConnectResponderClick(button, msg, tipo)
+	button.MouseButton1Click:Connect(function()
+		if tipo == "Enquete" then return end 
+		mensagemRespondidaId = msg.ID
+		mensagemRespondidaNome = msg.Player
+		RespostaLabel.Text = "Respondendo a "..mensagemRespondidaNome
+		RespostaFrame.Visible = true
+		TextBox:CaptureFocus()
+	end)
+end
+
+-- // FUNÇÃO REUTILIZÁVEL PARA CRIAR O BOTÃO (LÓGICA DE POSIÇÃO CORRIGIDA PARA ESQUERDA)
+local function CreateResponderButton(parentFrame, msg, tipo, currentHeight)
+	local yPosition = currentHeight + BUTTON_PADDING_BOTTOM
+	
+	local ResponderButton = Instance.new("TextButton", parentFrame)
+	ResponderButton.Size = UDim2.new(0, RESPONDER_BUTTON_WIDTH, 0, RESPONDER_BUTTON_HEIGHT) 
+	
+	-- CHAVE PARA O CANTO INFERIOR ESQUERDO
+	-- Scale X = 0 (Ancora na borda esquerda), Offset X = BUTTON_X_OFFSET (Empurra para a direita)
+	ResponderButton.Position = UDim2.new(0, BUTTON_X_OFFSET, 0, yPosition)
+	
+	ResponderButton.Text = "Responder"
+	ResponderButton.TextSize = 12
+	ResponderButton.TextColor3 = Color3.fromRGB(120, 120, 120) 
+	ResponderButton.BackgroundTransparency = 1
+	ResponderButton.AutoButtonColor = false
+	ResponderButton.Font = Enum.Font.SourceSans
+	ResponderButton.TextXAlignment = Enum.TextXAlignment.Center
+	
+	ConnectResponderClick(ResponderButton, msg, tipo)
+
+	if tipo == "Enquete" then
+		ResponderButton.Visible = false
+	end
+	
+	return yPosition + RESPONDER_BUTTON_HEIGHT -- Retorna a nova altura total do frame de conteúdo
+end
+
+-- BLOCO DE ÁUDIO RESTRUTURADO (COM SEEKING E PAUSE/PLAY)
+if tipo == "Audio" and dados.AudioId then
+	local audioId = tonumber(dados.AudioId)
+	
+	-- Cria o objeto Sound 
+	local audioPlayer = Instance.new("Sound", mediaContentFrame)
+	audioPlayer.SoundId = "rbxassetid://"..audioId
+	audioPlayer.Volume = 0.5
+	
+	-- Container principal do Player (Horizontal)
+	local AudioPlayerFrame = Instance.new("Frame", mediaContentFrame)
+	AudioPlayerFrame.Name = "AudioPlayerFrame"
+	AudioPlayerFrame.Size = UDim2.new(1, 0, 0, 40)
+	AudioPlayerFrame.BackgroundTransparency = 1
+	
+	contentHeight = 40
+	
+	-- 1. BOTÃO PLAY/PAUSE
+	local PlayPauseButton = Instance.new("ImageButton", AudioPlayerFrame)
+	PlayPauseButton.Name = "PlayPauseButton"
+	PlayPauseButton.Size = UDim2.new(0, 30, 0, 30)
+	PlayPauseButton.Position = UDim2.new(0, 0, 0.5, -15)
+	PlayPauseButton.Image = ICON_PLAY -- Ícone Play
+	PlayPauseButton.BackgroundColor3 = COR_BOTAO_PRIMARIO
+	PlayPauseButton.BackgroundTransparency = 0
+	PlayPauseButton.ScaleType = Enum.ScaleType.Fit
+	
+	local UICorner_PlayPause = Instance.new("UICorner", PlayPauseButton)
+	UICorner_PlayPause.CornerRadius = UDim.new(0.5, 0)
+	
+	-- 2. LINHA DE PROGRESSO (Container)
+	local ProgressBarContainer = Instance.new("Frame", AudioPlayerFrame)
+	ProgressBarContainer.Size = UDim2.new(1, -95, 0, 20)
+	ProgressBarContainer.Position = UDim2.new(0, 35, 0.5, -10)
+	ProgressBarContainer.BackgroundTransparency = 1
+	
+	local ProgressLine = Instance.new("Frame", ProgressBarContainer)
+	ProgressLine.Name = "ProgressLine"
+	ProgressLine.Size = UDim2.new(1, 0, 0, 4)
+	ProgressLine.Position = UDim2.new(0, 0, 0.5, -2)
+	ProgressLine.BackgroundColor3 = Color3.fromRGB(80, 80, 80) -- Cinza Escuro (Linha base)
+	ProgressLine.BorderSizePixel = 0
+	ProgressLine.Active = true -- ESSENCIAL para receber input (cliques/toque)
+	
+	local ProgressFill = Instance.new("Frame", ProgressLine)
+	ProgressFill.Name = "ProgressFill"
+	ProgressFill.Size = UDim2.new(0, 0, 1, 0) -- Começa em 0
+	ProgressFill.BackgroundColor3 = COR_DESTAQUE -- Cor de destaque (Progresso)
+	ProgressFill.BorderSizePixel = 0
+	
+	local SeekHandle = Instance.new("Frame", ProgressLine)
+	SeekHandle.Name = "SeekHandle"
+	SeekHandle.Size = UDim2.new(0, 10, 0, 10)
+	SeekHandle.Position = UDim2.new(0, -5, 0.5, -5) -- Posição inicial: 0%, offset de -5 para centralizar
+	SeekHandle.BackgroundColor3 = COR_TEXTO
+	SeekHandle.ZIndex = 2
+	SeekHandle.Active = true -- ESSENCIAL para permitir arrastar a bolinha
+	
+	local UICorner_Handle = Instance.new("UICorner", SeekHandle)
+	UICorner_Handle.CornerRadius = UDim.new(0.5, 0)
+	
+	-- 3. TEMPO RESTANTE
+	local TimeLabel = Instance.new("TextLabel", AudioPlayerFrame)
+	TimeLabel.Name = "TimeLabel"
+	TimeLabel.Size = UDim2.new(0, 60, 0, 20)
+	TimeLabel.Position = UDim2.new(1, -60, 0.5, -10)
+	TimeLabel.Text = "..." -- Inicializa com "..."
+	TimeLabel.TextColor3 = COR_TEXTO
+	TimeLabel.BackgroundTransparency = 1
+	TimeLabel.TextSize = 14
+	TimeLabel.Font = Enum.Font.SourceSansBold
+	
+	-- VARIÁVEIS DE ESTADO DO PLAYER LOCAL
+	local isPlaying = false
+	local updateConnection = nil
+	local isDragging = false
+	local duration = 0
+	local isDurationKnown = false
+
+	-- Função para calcular e atualizar a duração
+	local function UpdateDuration(sound)
+		if sound.IsLoaded and sound.TimeLength > 0 then
+			duration = sound.TimeLength
+			TimeLabel.Text = FormatTime(duration) -- Mostra a duração total
+			isDurationKnown = true
+		end
+	end
+
+	-- Tenta obter a duração imediatamente ou espera o carregamento
+	UpdateDuration(audioPlayer)
+	audioPlayer.Loaded:Connect(function()
+		UpdateDuration(audioPlayer)
+	end)
+	
+	-- LÓGICA DE UPDATE DE PROGRESSO (Heartbeat Loop)
+	local function UpdateProgress()
+		if isDragging or not audioPlayer.IsPlaying or not isDurationKnown then return end
+		
+		local currentTime = audioPlayer.TimePosition
+		local progress = currentTime / duration
+		
+		-- Atualiza Barra de Preenchimento
+		ProgressFill.Size = UDim2.new(progress, 0, 1, 0)
+		
+		-- Atualiza Handle (Bolinha)
+		SeekHandle.Position = UDim2.new(progress, -5, 0.5, -5)
+		
+		-- Atualiza Tempo Restante (contagem decrescente)
+		local remainingTime = math.max(0, duration - currentTime)
+		TimeLabel.Text = "-" .. FormatTime(remainingTime)
+	end
+	
+	-- LÓGICA DE PLAY/PAUSE
+	local isStopCooldown = false
+
+	local function StopCurrentPlaying()
+		if isStopCooldown then return end
+		isStopCooldown = true
+
+		if currentPlayingSound and currentPlayingSound.Parent then
+			local oldPlayerFrame = currentPlayingSound.Parent:FindFirstAncestor("AudioPlayerFrame")
+			if oldPlayerFrame then
+				local oldButton = oldPlayerFrame:FindFirstChild("PlayPauseButton")
+				local oldProgress = oldPlayerFrame:FindFirstDescendant("ProgressFill")
+				local oldHandle = oldPlayerFrame:FindFirstDescendant("SeekHandle")
+				local oldTime = oldPlayerFrame:FindFirstDescendant("TimeLabel")
+
+				if oldButton then oldButton.Image = ICON_PLAY end
+				if oldProgress then oldProgress.Size = UDim2.new(0,0,1,0) end
+				if oldHandle then oldHandle.Position = UDim2.new(0,-5,0.5,-5) end
+				if oldTime then 
+					-- Tenta recalcular a duração total para resetar o tempo
+					if oldTime.Text:match("^%-") then
+						local oldPlayer = currentPlayingSound
+						if oldPlayer.IsLoaded and oldPlayer.TimeLength > 0 then
+							oldTime.Text = FormatTime(oldPlayer.TimeLength)
+						else
+							oldTime.Text = "0:00"
+						end
+					end
+				end
+			end
+
+			currentPlayingSound:Stop()
+			currentPlayingSound.TimePosition = 0
+		end
+		currentPlayingSound = nil
+
+		task.delay(0.3, function() isStopCooldown = false end)
+	end
+
+	local function TogglePlayback()
+		if not isDurationKnown then return end
+
+		-- 🚫 Impede dois áudios ao mesmo tempo
+		if currentPlayingSound and currentPlayingSound ~= audioPlayer and currentPlayingSound.IsPlaying then
+			StopCurrentPlaying() -- Reseta o outro antes
+		end
+
+		if audioPlayer.IsPlaying then
+			audioPlayer:Pause()
+			isPlaying = false
+			PlayPauseButton.Image = ICON_PLAY
+			if updateConnection then updateConnection:Disconnect() updateConnection = nil end
+			if currentPlayingSound == audioPlayer then currentPlayingSound = nil end
+		else
+			audioPlayer:Play()
+			isPlaying = true
+			currentPlayingSound = audioPlayer
+			PlayPauseButton.Image = ICON_PAUSE
+
+			if updateConnection then updateConnection:Disconnect() end
+			updateConnection = RunService.Heartbeat:Connect(UpdateProgress)
+		end
+	end
+
+	PlayPauseButton.MouseButton1Click:Connect(TogglePlayback)
+	
+	-- FIM DO ÁUDIO: RESET
+	audioPlayer.Ended:Connect(function()
+		isPlaying = false
+		PlayPauseButton.Image = ICON_PLAY -- Ícone Play
+		ProgressFill.Size = UDim2.new(0, 0, 1, 0)
+		SeekHandle.Position = UDim2.new(0, -5, 0.5, -5)
+		TimeLabel.Text = FormatTime(duration)
+		audioPlayer.TimePosition = 0 -- Garante reset após o fim
+		
+		if updateConnection then updateConnection:Disconnect() end
+		if currentPlayingSound == audioPlayer then currentPlayingSound = nil end
+	end)
+	
+	-- LÓGICA DE SEEKING (Mouse/Touch na Barra de Progresso)
+	local function OnDrag(input)
+		if not isDragging or not isDurationKnown then return end
+		
+		-- Usa a posição absoluta do input e subtrai a posição absoluta da barra de progresso.
+		local relativeX = math.clamp(input.Position.X - ProgressLine.AbsolutePosition.X, 0, ProgressLine.AbsoluteSize.X)
+		local progress = relativeX / ProgressLine.AbsoluteSize.X
+		
+		-- Atualiza UI durante o drag
+		ProgressFill.Size = UDim2.new(progress, 0, 1, 0)
+		SeekHandle.Position = UDim2.new(progress, -5, 0.5, -5)
+		
+		-- Atualiza o tempo no label (para feedback imediato)
+		local newTimePosition = progress * duration
+		local remainingTime = math.max(0, duration - newTimePosition)
+		TimeLabel.Text = "-" .. FormatTime(remainingTime)
+	end
+
+	local function OnSeekEnd(input)
+		if not isDragging or not isDurationKnown then return end
+		isDragging = false
+
+		local relativeX = math.clamp(input.Position.X - ProgressLine.AbsolutePosition.X, 0, ProgressLine.AbsoluteSize.X)
+		local progress = relativeX / ProgressLine.AbsoluteSize.X
+		local newTimePosition = progress * duration
+
+		audioPlayer.TimePosition = newTimePosition -- MOVE o som
+
+		-- ⚙️ SINCRONIZA: reinicia o loop de atualização
+		if updateConnection then updateConnection:Disconnect() end
+		updateConnection = RunService.Heartbeat:Connect(UpdateProgress)
+
+		-- 🔁 Se o áudio estava tocando, retoma do novo ponto
+		if isPlaying then
+			audioPlayer:Play()
+		end
+	end
+	
+	local function OnSeekStart(input)
+		-- ESSENCIAL: Garante que apenas clique ou toque inicie o drag
+		if not isDurationKnown or not (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then return end
+		
+		-- 🚫 Impede interação se outro áudio estiver tocando
+		if currentPlayingSound and currentPlayingSound ~= audioPlayer and currentPlayingSound.IsPlaying then
+			warn("[Bloqueado] Outro áudio está tocando. Aguarde ele parar antes de mover este.")
+			return
+		end
+		
+		isDragging = true
+		if updateConnection then updateConnection:Disconnect() end -- Pausa o update automático durante o drag
+		
+		OnDrag(input) -- Executa a primeira atualização para mover o handle para onde o usuário clicou
+	end
+	
+	-- Conexões de Input para a LINHA inteira (mais fácil de tocar/clicar)
+	ProgressBarContainer.InputBegan:Connect(OnSeekStart)
+	ProgressBarContainer.InputChanged:Connect(function(input)
+		if isDragging then OnDrag(input) end
+	end)
+	ProgressBarContainer.InputEnded:Connect(function(input)
+		if isDragging then OnSeekEnd(input) end
+	end)
+
+	-- Permite drag/click no Handle também
+	SeekHandle.InputBegan:Connect(OnSeekStart)
+	SeekHandle.InputChanged:Connect(function(input)
+		if isDragging then OnDrag(input) end
+	end)
+	SeekHandle.InputEnded:Connect(function(input)
+		if isDragging then OnSeekEnd(input) end
+	end)
+	
+	-- AQUI: ADICIONA O BOTÃO RESPONDER ABAIXO DO PLAYER DE ÁUDIO
+	contentHeight = CreateResponderButton(mediaContentFrame, msg, tipo, contentHeight)
+
+elseif tipo == "Imagem" and dados.ImageId then
+	local imgLabel = Instance.new("ImageLabel", mediaContentFrame)
+	imgLabel.Size = UDim2.new(0,100,0,100)
+	imgLabel.Image = "rbxassetid://"..dados.ImageId
+	imgLabel.BackgroundTransparency = 0
+	imgLabel.BackgroundColor3 = COR_SUPERFICIE
+	imgLabel.ScaleType = Enum.ScaleType.Fit
+	
+	local UICorner_Image = Instance.new("UICorner", imgLabel)
+	UICorner_Image.CornerRadius = UDim.new(0, RAIO_CANTO_PEQUENO)
+
+	local msgLabel = Instance.new("TextLabel", mediaContentFrame)
+	msgLabel.Size = UDim2.new(1,0,0,20)
+	msgLabel.Position = UDim2.new(0,0,0,105)
+	msgLabel.Text = msg.Mensagem
+	msgLabel.TextXAlignment = Enum.TextXAlignment.Left
+	msgLabel.BackgroundTransparency = 1
+	msgLabel.TextColor3 = COR_TEXTO
+	msgLabel.TextSize = 15
+	
+	contentHeight = 130
+	
+	-- AQUI: ADICIONA O BOTÃO RESPONDER ABAIXO DA IMAGEM/TEXTO
+	contentHeight = CreateResponderButton(mediaContentFrame, msg, tipo, contentHeight)
+
+-- Trecho Onde o Clique é Criado (Bloco 'else' para tipo padrão/fallback)
+
+else -- TIPO PADRÃO (ou fallback para tipos inválidos)
+	-- NOTA: O msgLabel agora é um TextLabel (se não for Enquete)
+	local msgLabel = Instance.new("TextLabel", mediaContentFrame)
+	msgLabel.Size = UDim2.new(1,0,0,0) -- Tamanho inicial 0
+	msgLabel.Position = UDim2.new(0,0,0,0)
+	msgLabel.TextXAlignment = Enum.TextXAlignment.Left
+	msgLabel.TextWrapped = true
+	msgLabel.TextSize = 15
+	msgLabel.Font = Enum.Font.SourceSans
+	msgLabel.AutomaticSize = Enum.AutomaticSize.Y -- Permite que o texto se ajuste automaticamente na altura
+	
+	
+	-- Lógica para Enquetes
+	if tipo == "Enquete" then
+		msgLabel.Text = "❌ Mensagem antiga do tipo ENQUETE (Removida)"
+		msgLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+		msgLabel.BackgroundTransparency = 0.8
+		msgLabel.BackgroundColor3 = Color3.fromRGB(70, 40, 40)
+		
+	else
+		-- Tipo Padrão
+		msgLabel.Text = msg.Mensagem
+		msgLabel.TextColor3 = COR_TEXTO
+		msgLabel.BackgroundTransparency = 1
+		msgLabel.BackgroundColor3 = COR_MENSAGEM
+	end
+	
+	-- Assegurar que o TextLabel (msgLabel) não captura o clique
+	msgLabel.TextXAlignment = Enum.TextXAlignment.Left
+	
+	task.wait() -- Espera o AutomaticSize do msgLabel ser calculado
+	
+	-- 1. Obter a altura real do texto da mensagem
+	local textHeight = msgLabel.AbsoluteSize.Y
+	contentHeight = textHeight -- Altura base
+
+	-- 2. ADICIONA O BOTÃO RESPONDER ABAIXO DO TEXTO
+	contentHeight = CreateResponderButton(mediaContentFrame, msg, tipo, contentHeight)
+	
+end
+
+-- Ajusta o tamanho do frame de conteúdo de mídia (AGORA USA O contentHeight ATUALIZADO)
+mediaContentFrame.Size = UDim2.new(1,-x-10,0,contentHeight)
+	
+	-- Hora Label
+	local horaLabel = Instance.new("TextLabel", contentWrapper)
+	horaLabel.Size = UDim2.new(0,60,0,15)
+	horaLabel.Position = UDim2.new(1,-65,0,y + contentHeight + 2)
+	horaLabel.Text = FormatarTempoRelativo(timestamp)	
+	horaLabel.TextColor3 = Color3.fromRGB(120,120,120)
+	horaLabel.BackgroundTransparency = 1
+	horaLabel.TextXAlignment = Enum.TextXAlignment.Right
+	horaLabel.TextSize = 12
+
+	-- Ajusta o tamanho final do frame de container
+	contentWrapper.Size = UDim2.new(1,-10,0,y + contentHeight + 20)
+	
+	ultimaMsgTimestamp = math.max(ultimaMsgTimestamp, timestamp)
+	
+	ProcessarComando(msg)
+end
+
+local function TryDecodeDadosField(dadosField)
+	if not dadosField or dadosField == "" then return nil end
+	local ok, decoded = pcall(function() return HttpService:JSONDecode(dadosField) end)
+	if ok and type(decoded) == "table" then return decoded end
+	return nil
+end
+
+local function HandleBanPayloadFromMessage(msg)
+	if not msg or not msg.Dados then return end
+	local parsed = TryDecodeDadosField(msg.Dados)
+	if not parsed then return end
+	local ban = parsed.Ban
+	if not ban then return end
+
+	-- Normaliza tipos
+	if ban.TargetUserId then ban.TargetUserId = tonumber(ban.TargetUserId) end
+	if ban.DurationMinutes then ban.DurationMinutes = tonumber(ban.DurationMinutes) end
+	if ban.Timestamp then ban.Timestamp = tonumber(ban.Timestamp) end
+
+	-- Se o alvo for o LocalPlayer => carregar detalhes da aba Punições e aplicar ban local
+	if ban.TargetUserId == LocalPlayer.UserId then
+		-- tenta buscar detalhes completos na aba de Punições (garantir consistência)
+		task.spawn(function()
+			local suc, punicoes = pcall(function()
+				local resp = http_request({ Url = url.."?pagina="..PUNICOES_SHEET_NAME, Method = "GET" })
+				if not resp or not resp.Body then return nil end
+				return HttpService:JSONDecode(resp.Body)
+			end)
+			if suc and type(punicoes) == "table" then
+				-- procura o registro mais recente que bata com MessageID ou TargetUserId
+				local matched = nil
+				for _, p in ipairs(punicoes) do
+					if p.MessageID and p.MessageID == msg.ID then matched = p end
+				end
+				if not matched then
+					for _, p in ipairs(punicoes) do
+						if tonumber(p.TargetUserId) == LocalPlayer.UserId then matched = p end
+					end
+				end
+				local banDetails = nil
+				if matched then
+					banDetails = {
+						TargetUserId = tonumber(matched.TargetUserId) or LocalPlayer.UserId,
+						TargetName = matched.TargetName or LocalPlayer.Name,
+						ModeratorUserId = tonumber(matched.ModeratorUserId) or 0,
+						ModeratorName = matched.ModeratorName or "Unknown",
+						Motivo = matched.Motivo or ban.Motivo or "Sem motivo",
+						DurationMinutes = tonumber(matched.DurationMinutes) or ban.DurationMinutes or 0,
+						Timestamp = tonumber(matched.Timestamp) or ban.Timestamp or os.time(),
+						MessageID = matched.MessageID or msg.ID
+					}
+				else
+					banDetails = {
+						TargetUserId = ban.TargetUserId,
+						TargetName = ban.TargetName or "Você",
+						ModeratorUserId = ban.ModeratorUserId or 0,
+						ModeratorName = ban.ModeratorName or "Unknown",
+						Motivo = ban.Motivo or "Sem motivo",
+						DurationMinutes = ban.DurationMinutes or 0,
+						Timestamp = ban.Timestamp or os.time(),
+						MessageID = msg.ID
+					}
+				end
+				ApplyLocalBan(banDetails)
+			else
+				-- fallback: aplicar ban com o que veio no payload
+				local banDetails = {
+					TargetUserId = ban.TargetUserId,
+					TargetName = ban.TargetName or "Você",
+					ModeratorUserId = ban.ModeratorUserId or 0,
+					ModeratorName = ban.ModeratorName or "Unknown",
+					Motivo = ban.Motivo or "Sem motivo",
+					DurationMinutes = ban.DurationMinutes or 0,
+					Timestamp = ban.Timestamp or os.time(),
+					MessageID = msg.ID
+				}
+				ApplyLocalBan(banDetails)
+			end
+		end)
+	else
+		-- Se for outra pessoa: exibir aviso administrativo no chat (não bloquear)
+		local notice = Instance.new("TextLabel", ScrollingFrame)
+		notice.Size = UDim2.new(1, -20, 0, 20)
+		notice.BackgroundTransparency = 1
+		notice.TextColor3 = Color3.fromRGB(255, 170, 0)
+		notice.Text = string.format("⚠️ [Mod] %s foi punido por %s", ban.TargetName or "Um jogador", ban.Motivo or "Sem motivo")
+		notice.Font = Enum.Font.SourceSansItalic
+		notice.TextSize = 14
+		notice.LayoutOrder = tonumber(msg.Timestamp) or os.time()
+		task.defer(function() ScrollingFrame.CanvasSize = UDim2.new(0,0,0,UIListLayout.AbsoluteContentSize.Y) end)
+	end
+end
+
+local function AtualizarMensagens(limite, isLoadMore)
+	
+	if isLoadOldCooldown and isLoadMore then return end
+	
+	if isLoadMore then
+		isLoadOldCooldown = true
+		LoadOld.Text = "⏳ Carregando..."
+		LoadOld.BackgroundColor3 = Color3.fromRGB(90, 70, 70)
+	elseif not isInitialLoadComplete then -- NOVO: Estado de loading inicial
+		UpdateLoadingStatus(0, string.format("📥 Baixando %d mensagens iniciais...", limite), 33)
+	end
+	
+	local fetchLimit = limite or MESSAGES_TO_LOAD_INITIAL	
+
+	local success, result = pcall(function()
+		local response = http_request({
+			Url = url.."?pagina="..DATA_SHEET_NAME, -- ChatGlobal
+			Method = "GET"	
+		})
+		if not response or not response.Body then return nil end
+		return HttpService:JSONDecode(response.Body)
+	end)
+	
+	if success and result and type(result) == "table" then
+		
+		table.sort(result, function(a,b) return tonumber(a.Timestamp) < tonumber(b.Timestamp) end)
+
+		if isLoadMore and #result <= fetchLimit then
+			LoadOld.Visible = false
+		end
+		
+		local oldContentSize = UIListLayout.AbsoluteContentSize.Y
+		
+		local mapaMensagens = {}
+		for _, msg in ipairs(result) do mapaMensagens[msg.ID] = msg end
+
+		local novasMensagensAdicionadas = false
+		local startIndex = math.max(1, #result - fetchLimit)
+		
+		for i = startIndex, #result do
+			local msg = result[i]
+			ProcessarComando(msg)	
+
+			-- DETECÇÃO DE PAYLOAD DE BAN (Se existir, processa antes de criar UI)
+			local parsedDados = TryDecodeDadosField(msg.Dados)
+			if parsedDados and parsedDados.Ban then
+				HandleBanPayloadFromMessage(msg)
+			end
+
+			-- Apenas cria a mensagem se ela ainda não foi criada
+			if not mensagensCriadas[msg.ID] then
+				CriarMensagem(msg, mapaMensagens)
+				novasMensagensAdicionadas = true
+			end
+		end
+		
+		if novasMensagensAdicionadas then
+			UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+			task.wait()	
+			ScrollingFrame.CanvasSize = UDim2.new(0,0,0,UIListLayout.AbsoluteContentSize.Y)
+			
+			local newContentSize = UIListLayout.AbsoluteContentSize.Y
+			
+			if isLoadMore then
+				local diff = newContentSize - oldContentSize
+				ScrollingFrame.CanvasPosition = Vector2.new(0, diff)	
+			elseif not isInitialLoadComplete then
+				-- Scrolla para o final na carga inicial
+				ScrollingFrame.CanvasPosition = Vector2.new(0, math.huge)
+				isInitialLoadComplete = true
+			else
+				local scrollDistance = ScrollingFrame.CanvasSize.Y.Offset - ScrollingFrame.AbsoluteSize.Y
+				if ScrollingFrame.CanvasPosition.Y >= scrollDistance - 100 then	
+					ScrollingFrame.CanvasPosition = Vector2.new(0, math.huge)
+				end
+			end
+		end
+	end
+	
+	if not isLoadMore and not isLoadingCompleted then -- NOVO: Finaliza o Loading Inicial
+		UpdateLoadingStatus(100, "✅ Carregamento Concluído!", 33)
+		TextBox.TextEditable = true -- Libera o input
+		Enviar.Active = true
+	end
+	
+	if isLoadMore then
+		isLoadOldCooldown = false
+		LoadOld.Text = "🕓 Carregar mais mensagens"
+		LoadOld.BackgroundColor3 = Color3.fromRGB(60,60,80)
+	end
+end
+
+-- Conexão do botão "Carregar mais"
+LoadOld.MouseButton1Click:Connect(function()
+	if isLoadOldCooldown or not isLoadingCompleted then return end
+	
+	currentLoadedLimit = currentLoadedLimit + MESSAGES_TO_LOAD_MORE
+	AtualizarMensagens(currentLoadedLimit, true)
+end)
+
+-- Loop principal
+task.spawn(function()
+	-- 1. Carrega as informações do jogador
+	LoadPlayerInfo()	
+	
+	-- 2. Inicia o chat e o loop de atualização
+	AtualizarMensagens(MESSAGES_TO_LOAD_INITIAL, false)	
+	while true do
+		-- Apenas atualiza após a carga inicial
+		if isLoadingCompleted then
+			AtualizarMensagens(currentLoadedLimit, false)
+		end
+		-- Se havia pending local ban aguardar e aplicar
+		if _G.__pending_local_ban and type(_G.__pending_local_ban) == "table" and not isLocallyBanned then
+			ApplyLocalBan(_G.__pending_local_ban)
+			_G.__pending_local_ban = nil
+		end
+		task.wait(3)
+	end
+end)
+
+-- OBS: As demais partes do script (GUI construction, preview, audio player, ban panel UI etc.)
+-- foram mantidas. As integrações para criação de payloads /ban e leitura da aba Punições foram
+-- adicionadas nas funções acima.
