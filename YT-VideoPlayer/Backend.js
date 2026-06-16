@@ -26,15 +26,23 @@ app.post('/yt/video', async (req, res) => {
 
     print(`Iniciando download blindado (yt-dlp): ${videoURL}`);
 
-    try {
-        // O yt-dlp baixa, usa o ffmpeg para juntar vídeo/áudio e salva o .webm perfeito no disco
-        await exec(videoURL, {
-            format: 'bestvideo[ext=webm][height<=720]+bestaudio[ext=webm]/best[ext=webm]/best',
-            mergeOutputFormat: 'webm',
-            output: tempPath,
-            ffmpegLocation: ffmpegPath, // Força o uso do FFmpeg interno do projeto
-            noWarnings: true
-        });
+    // Substitua o bloco try/catch dentro da rota /yt/video por este:
+try {
+    await exec(videoURL, {
+        format: 'bestvideo[ext=webm][height<=720]+bestaudio[ext=webm]/best[ext=webm]/best',
+        mergeOutputFormat: 'webm',
+        output: tempPath,
+        ffmpegLocation: ffmpegPath,
+        // Adicionando camuflagem contra bloqueio de bot
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        referer: 'https://www.youtube.com/',
+        addHeader: [
+            'Accept-Language:en-US,en;q=0.9',
+            'Connection:keep-alive'
+        ],
+        noWarnings: true
+    });
+// ... resto do código igual
 
         print(`Download e conversão concluídos! Enviando ${cleanId}.webm para o executor...`);
         
