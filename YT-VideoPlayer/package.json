@@ -1,0 +1,13 @@
+{
+  "name": "roblox-video-api",
+  "version": "1.0.0",
+  "main": "Backend.js",
+  "scripts": {
+    "start": "node Backend.js"
+  },
+  "dependencies": {
+    "@distube/ytdl-core": "^4.15.0",
+    "express": "^4.19.2",
+    "ffmpeg-static": "^5.2.0"
+  }
+}
