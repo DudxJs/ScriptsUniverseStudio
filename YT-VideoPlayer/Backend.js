@@ -1,7 +1,6 @@
 const childProcess = require('child_process');
 const ffmpeg = require('ffmpeg-static');
 const express = require('express');
-// Usando a versão mantida e atualizada para não tomar block do YouTube
 const ytdl = require('@distube/ytdl-core'); 
 
 const app = express();
@@ -44,6 +43,10 @@ app.post('/yt/video', async (req, res) => {
             let video = ytdl.downloadFromInfo(info, { quality: videoQuality });
             let audio = ytdl.downloadFromInfo(info, { quality: 'highestaudio' });
             
+            // Rastreadores de erro para o Stream do YouTube (IP Block)
+            video.on('error', (err) => print('ERRO STREAM VÍDEO: ' + err.message));
+            audio.on('error', (err) => print('ERRO STREAM ÁUDIO: ' + err.message));
+            
             let ffmpegProcess = childProcess.spawn(ffmpeg, ['-loglevel', 'quiet',
                 '-i', 'pipe:0', '-i', 'pipe:1', '-map', '0:v', '-map', '1:a',
                 '-metadata','duration=' + info.videoDetails.lengthSeconds,
@@ -65,7 +68,6 @@ app.post('/yt/video', async (req, res) => {
     }
 });
 
-// A rota de áudio adaptada com a mesma lógica de limpeza de link
 app.post('/yt/audio', async (req, res) => {
     let rawId = req.query.videoId;
     if (!rawId) return res.sendStatus(404);
@@ -77,6 +79,10 @@ app.post('/yt/audio', async (req, res) => {
         try { 
             print('Baixando áudio: ' + videoURL);
             let audio = ytdl(videoURL, { quality: 'highestaudio' });
+            
+            // Rastreador de erro para o Stream de Áudio
+            audio.on('error', (err) => print('ERRO STREAM ÁUDIO (MP3): ' + err.message));
+
             let ffmpegProcess = childProcess.spawn(ffmpeg, [
                 '-loglevel','quiet', '-i', 'pipe:0',
                 '-f', 'mp3', 'pipe:1'
